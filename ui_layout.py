@@ -33,10 +33,12 @@ def create_layout(app, interfaces):
     fields = [
         ("Remote IP", "192.168.1.11"),
         ("Loss Threshold (%)", "10.0"),
-        ("Latency Threshold (ms)", "70")
+        ("Latency Threshold (ms)", "70"),
+        ("Remote MAC", "98:ba:5f:a9:7b:72")
     ]
 
     latency_label = None
+    remote_mac_label = None
     for i, (label_text, default) in enumerate(fields):
         label = ttk.Label(left_form, text=label_text)
         label.grid(row=i, column=0, sticky="w", pady=2)
@@ -46,6 +48,8 @@ def create_layout(app, interfaces):
         entries[label_text] = entry
         if label_text == "Latency Threshold (ms)":
             latency_label = label
+        if label_text == "Remote MAC":
+            remote_mac_label = label
 
     iface_var = tk.StringVar(value=interfaces[0])
     profile_var = tk.StringVar(value="Moderate")
@@ -53,6 +57,16 @@ def create_layout(app, interfaces):
     protocol_var = tk.StringVar(value="UDP")
     direction_var = tk.StringVar(value="Uplink")
     packet_size_var = tk.StringVar(value="1400")
+    ethertype_var = tk.StringVar(value="IPv4")
+    ethertype_label = ttk.Label(right_form, text="EtherType")
+    ethertype_menu = ttk.Combobox(
+        right_form,
+        textvariable=ethertype_var,
+        values=["IPv4", "ARP", "IPv6", "VLAN", "MPLS", "PPPoE", "Loopback", "Unknown", "0xFFFF"],
+        state="readonly"
+    )
+    ethertype_label.grid(row=6, column=0, sticky="w", pady=2)
+    ethertype_menu.grid(row=6, column=1, pady=2)
 
     def combo(row, label, var, values, parent):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
@@ -62,7 +76,7 @@ def create_layout(app, interfaces):
 
     combo(0, "Select Interface", iface_var, interfaces, right_form)
     combo(1, "Speed Profile", profile_var, ["Safe", "Moderate", "Aggressive"], right_form)
-    combo(2, "Traffic Type", traffic_var, ["iperf3", "Flood Ping"], right_form)
+    combo(2, "Traffic Type", traffic_var, ["iperf3", "Flood Ping", "L2/L3 Traffic"], right_form)
 
     packet_label = ttk.Label(right_form, text="Packet Size (Flood Ping)")
     packet_entry = ttk.Entry(right_form, textvariable=packet_size_var)
@@ -88,22 +102,41 @@ def create_layout(app, interfaces):
             direction_menu.grid_remove()
             entries["Latency Threshold (ms)"].grid()
             latency_label.grid()
+            entries["Remote MAC"].grid_remove()
+            remote_mac_label.grid_remove()
+            ethertype_label.grid_remove()
+            ethertype_menu.grid_remove()
+        elif traffic_var.get() == "L2/L3 Traffic":
+            packet_label.grid()
+            packet_entry.grid()
+            protocol_label.grid_remove()
+            protocol_menu.grid_remove()
+            direction_label.grid_remove()
+            direction_menu.grid_remove()
+            entries["Latency Threshold (ms)"].grid_remove()
+            latency_label.grid_remove()
+            ethertype_label.grid()
+            ethertype_menu.grid()
+            entries["Remote MAC"].grid()
+            remote_mac_label.grid()
         else:
-            packet_label.grid_remove()
-            packet_entry.grid_remove()
+            packet_label.grid()
+            packet_entry.grid()
             protocol_label.grid()
             protocol_menu.grid()
             direction_label.grid()
             direction_menu.grid()
-
             entries["Latency Threshold (ms)"].grid_remove()
             latency_label.grid_remove()
+            entries["Remote MAC"].grid_remove()
+            remote_mac_label.grid_remove()
+            ethertype_label.grid_remove()
+            ethertype_menu.grid_remove()
 
-            # Update direction menu based on selected protocol
             if protocol_var.get() == "UDP":
                 direction_menu['values'] = ["Uplink", "Downlink"]
                 if direction_var.get() == "Bi-Di":
-                    direction_var.set("Uplink")  # fallback
+                    direction_var.set("Uplink")
             else:
                 direction_menu['values'] = ["Uplink", "Downlink", "Bi-Di"]
 
@@ -189,4 +222,7 @@ def create_layout(app, interfaces):
         "save_latency_graph_btn": save_latency_graph_btn,
         "status_bar": status_bar,
         "metrics_labels": metrics_labels,
+        "ethertype_var": ethertype_var,
+        "ethertype_label": ethertype_label,
+        "ethertype_menu": ethertype_menu,
     }

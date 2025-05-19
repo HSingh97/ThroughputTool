@@ -8,11 +8,12 @@ from cleanup_utils import kill_iperf
 
 
 class IperfTest:
-    def __init__(self, remote_ip, iface, protocol, direction, profile, ui_refs, data_store, graph, update_metrics=None):
+    def __init__(self, remote_ip, iface, protocol,packet_size, direction, profile, ui_refs, data_store, graph, update_metrics=None):
         self.remote_ip = remote_ip
         self.iface = iface
         self.protocol = protocol
         self.direction = direction
+        self.packet_size = packet_size
         self.profile = profile
         self.ui = ui_refs
         self.data = data_store
@@ -58,10 +59,17 @@ class IperfTest:
             cmd = ["iperf3", "-c", self.remote_ip, "-t", "5", "-J", "-P", str(streams)]
             if self.protocol == "UDP":
                 cmd += ["-u", "-b", f"{current_bw}M"]
+
+            if self.packet_size:
+                cmd += ["-l", str(self.packet_size)]
+
             if self.direction == "Downlink":
                 cmd += ["-R"]
+
             elif self.direction == "Bi-Di":
                 cmd += ["--bidir"]
+
+            #self._log(f"[iPerf3 Cmd]: {' '.join(cmd)}")
 
             try:
                 proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
@@ -208,6 +216,9 @@ class IperfTest:
 
         self._log("\n-------------------- iPerf3 Test Completed --------------------")
         self._log(f"{'Test Duration':30}: {mins:02}:{secs:02} (mm:ss)")
+        if self.packet_size:
+            self._log(f"{'Packet Size Used':30}: {self.packet_size} bytes")
+
         self._log(f"{'Final Delivered Throughput':30}: {total:.2f} Mbps")
         if stable_tp is not None:
             self._log(f"{'Stable Max Throughput':30}: {stable_tp:.2f} Mbps")

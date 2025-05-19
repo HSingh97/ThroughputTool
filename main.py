@@ -6,7 +6,10 @@ from graph_manager import GraphManager
 from iperf_test import IperfTest
 from flood_ping_test import FloodPingTest
 from utils import export_log, save_graph
+from l2_traffic_test import L2TrafficTest
 import time
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 def main():
     app = tb.Window(themename="flatly")
@@ -47,15 +50,33 @@ def main():
             ui['direction_menu'].grid_remove()
             ui['entries']["Latency Threshold (ms)"].grid()
             ui['latency_label'].grid()
+            ui['entries']["Remote MAC"].grid_remove()
+        elif traffic_type == "L2/L3 Traffic":
+            # Hide other irrelevant options
+            ui['packet_size_label'].grid()
+            ui['packet_size_entry'].grid()
+            ui['protocol_label'].grid_remove()
+            ui['protocol_menu'].grid_remove()
+            ui['direction_label'].grid_remove()
+            ui['direction_menu'].grid_remove()
+            ui['entries']["Latency Threshold (ms)"].grid_remove()
+            ui['latency_label'].grid_remove()
+            # Show EtherType selector
+            ui['ethertype_label'].grid()
+            ui['ethertype_menu'].grid()
+            ui['entries']["Remote MAC"].grid()
         else:
-            ui['packet_size_label'].grid_remove()
-            ui['packet_size_entry'].grid_remove()
+            ui['packet_size_label'].grid()
+            ui['packet_size_entry'].grid()
             ui['protocol_label'].grid()
             ui['protocol_menu'].grid()
             ui['direction_label'].grid()
             ui['direction_menu'].grid()
             ui['entries']["Latency Threshold (ms)"].grid_remove()
             ui['latency_label'].grid_remove()
+            ui['ethertype_label'].grid_remove()
+            ui['ethertype_menu'].grid_remove()
+            ui['entries']["Remote MAC"].grid_remove()
 
     def start_test():
         ui['output_area'].config(state='normal')
@@ -75,6 +96,8 @@ def main():
         packet_size = int(ui['packet_size_var'].get())
         latency_thresh = float(ui['entries']['Latency Threshold (ms)'].get())
         loss_thresh = float(ui['entries']['Loss Threshold (%)'].get())
+        remote_mac = ui['entries']["Remote MAC"].get()
+        ethertype = ui['ethertype_var'].get()
 
         ui_refs = {
             'output_area': ui['output_area'],
@@ -102,12 +125,25 @@ def main():
             tester = FloodPingTest(remote_ip, iface, packet_size, profile,
                                    latency_thresh, loss_thresh, ui_refs, data_store, graph,
                                    update_metrics=update_metrics)
+        elif traffic == "L2/L3 Traffic":
+            tester = L2TrafficTest(
+                iface=iface,
+                ui_refs=ui_refs,
+                ethertype=ui['ethertype_var'].get(),
+                remote_mac=ui['entries']['Remote MAC'].get(),
+                packet_size=packet_size,
+                profile=profile,
+                data_store=data_store,
+                graph=graph,
+                update_metrics=update_metrics
+            )
 
         else:
             tester = IperfTest(
                 remote_ip,
                 iface,
                 protocol,
+                packet_size,
                 direction,
                 profile,
                 ui_refs,
