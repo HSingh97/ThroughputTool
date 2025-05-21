@@ -1,6 +1,6 @@
-
 import tkinter as tk
 from tkinter import ttk
+from tkinter import scrolledtext # Import the scrolledtext module
 
 def create_layout(app, interfaces):
     app.title("Smart Throughput & Flood Ping Tester")
@@ -13,14 +13,15 @@ def create_layout(app, interfaces):
     paned.pack(fill="both", expand=True)
 
     settings_frame = ttk.LabelFrame(paned, text="Settings", padding=15)
-    paned.add(settings_frame, weight=1)
+    paned.add(settings_frame, weight=1) # Adjust weight if you want settings pane smaller initially
 
     output_frame = ttk.Frame(paned)
-    paned.add(output_frame, weight=3)
+    paned.add(output_frame, weight=3) # Graph output gets more space
 
-    settings_frame.rowconfigure(4, weight=1)
-    settings_frame.columnconfigure(0, weight=1)
-    settings_frame.columnconfigure(1, weight=1)
+    settings_frame.rowconfigure(4, weight=1) # Make row 4 (output_area) expand
+    settings_frame.columnconfigure(0, weight=1) # Allow column 0 to expand
+    settings_frame.columnconfigure(1, weight=1) # Allow column 1 to expand
+
 
     left_form = ttk.Frame(settings_frame)
     left_form.grid(row=0, column=0, sticky="nw", padx=5)
@@ -51,7 +52,7 @@ def create_layout(app, interfaces):
         if label_text == "Remote MAC":
             remote_mac_label = label
 
-    iface_var = tk.StringVar(value=interfaces[0])
+    iface_var = tk.StringVar(value=interfaces[0] if interfaces else "")
     profile_var = tk.StringVar(value="Moderate")
     traffic_var = tk.StringVar(value="iperf3")
     protocol_var = tk.StringVar(value="UDP")
@@ -78,7 +79,7 @@ def create_layout(app, interfaces):
     combo(1, "Speed Profile", profile_var, ["Safe", "Moderate", "Aggressive"], right_form)
     combo(2, "Traffic Type", traffic_var, ["iperf3", "Flood Ping", "L2/L3 Traffic"], right_form)
 
-    packet_label = ttk.Label(right_form, text="Packet Size (Flood Ping)")
+    packet_label = ttk.Label(right_form, text="Packet Size") # Simplified label
     packet_entry = ttk.Entry(right_form, textvariable=packet_size_var)
     protocol_label = ttk.Label(right_form, text="Traffic Protocol Type")
     protocol_menu = ttk.Combobox(right_form, textvariable=protocol_var, values=["UDP", "TCP"], state="readonly")
@@ -93,43 +94,59 @@ def create_layout(app, interfaces):
     direction_menu.grid(row=5, column=1, pady=2)
 
     def update_visibility(*args):
-        if traffic_var.get() == "Flood Ping":
+        traffic_type = traffic_var.get()
+        # Update packet label based on traffic type
+        if traffic_type == "Flood Ping":
+            packet_label.config(text="Packet Size (Flood Ping)")
+        elif traffic_type == "L2/L3 Traffic":
+            packet_label.config(text="Packet Size (L2/L3)")
+        else: # iperf3
+            packet_label.config(text="Block/Length Size (iperf3)")
+
+
+        if traffic_type == "Flood Ping":
             packet_label.grid()
             packet_entry.grid()
             protocol_label.grid_remove()
             protocol_menu.grid_remove()
             direction_label.grid_remove()
             direction_menu.grid_remove()
-            entries["Latency Threshold (ms)"].grid()
-            latency_label.grid()
-            entries["Remote MAC"].grid_remove()
-            remote_mac_label.grid_remove()
+            if "Latency Threshold (ms)" in entries and latency_label:
+                entries["Latency Threshold (ms)"].grid()
+                latency_label.grid()
+            if "Remote MAC" in entries and remote_mac_label:
+                entries["Remote MAC"].grid_remove()
+                remote_mac_label.grid_remove()
             ethertype_label.grid_remove()
             ethertype_menu.grid_remove()
-        elif traffic_var.get() == "L2/L3 Traffic":
+        elif traffic_type == "L2/L3 Traffic":
             packet_label.grid()
             packet_entry.grid()
             protocol_label.grid_remove()
             protocol_menu.grid_remove()
             direction_label.grid_remove()
             direction_menu.grid_remove()
-            entries["Latency Threshold (ms)"].grid_remove()
-            latency_label.grid_remove()
+            if "Latency Threshold (ms)" in entries and latency_label:
+                entries["Latency Threshold (ms)"].grid_remove()
+                latency_label.grid_remove()
             ethertype_label.grid()
             ethertype_menu.grid()
-            entries["Remote MAC"].grid()
-            remote_mac_label.grid()
-        else:
+            if "Remote MAC" in entries and remote_mac_label:
+                entries["Remote MAC"].grid()
+                remote_mac_label.grid()
+        else: # iperf3
             packet_label.grid()
             packet_entry.grid()
             protocol_label.grid()
             protocol_menu.grid()
             direction_label.grid()
             direction_menu.grid()
-            entries["Latency Threshold (ms)"].grid_remove()
-            latency_label.grid_remove()
-            entries["Remote MAC"].grid_remove()
-            remote_mac_label.grid_remove()
+            if "Latency Threshold (ms)" in entries and latency_label:
+                entries["Latency Threshold (ms)"].grid_remove()
+                latency_label.grid_remove()
+            if "Remote MAC" in entries and remote_mac_label:
+                entries["Remote MAC"].grid_remove()
+                remote_mac_label.grid_remove()
             ethertype_label.grid_remove()
             ethertype_menu.grid_remove()
 
@@ -137,7 +154,7 @@ def create_layout(app, interfaces):
                 direction_menu['values'] = ["Uplink", "Downlink"]
                 if direction_var.get() == "Bi-Di":
                     direction_var.set("Uplink")
-            else:
+            else: # TCP
                 direction_menu['values'] = ["Uplink", "Downlink", "Bi-Di"]
 
     traffic_var.trace_add("write", update_visibility)
@@ -152,11 +169,8 @@ def create_layout(app, interfaces):
     start_button.grid(row=0, column=0, padx=5)
     stop_button.grid(row=0, column=1, padx=5)
 
-    #link_label = ttk.Label(settings_frame, text="Live Tx: 0.00 Mbps | Rx: 0.00 Mbps", font=("Segoe UI", 10))
-    #link_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
-
     metrics_frame = ttk.LabelFrame(settings_frame, text="Live Metrics", padding=(10, 5))
-    metrics_frame.grid(row=3, column=0, columnspan=2, sticky="we", pady=5)
+    metrics_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=5)
 
     metrics_labels = {
         "latency": ttk.Label(metrics_frame, text="Latency: N/A"),
@@ -167,10 +181,18 @@ def create_layout(app, interfaces):
         "duration": ttk.Label(metrics_frame, text="Duration: 00:00")
     }
 
-    for i, label in enumerate(metrics_labels.values()):
-        label.grid(row=0, column=i, padx=8)
+    for i in range(len(metrics_labels)):
+        metrics_frame.columnconfigure(i, weight=1)
 
-    output_area = tk.Text(settings_frame, wrap="word")
+    for i, label in enumerate(metrics_labels.values()):
+        label.grid(row=0, column=i, padx=5, sticky="ew")
+
+    # --- THIS IS THE CRITICAL CHANGE for SCROLLABLE LOGS ---
+    monospace_font = ("Courier New", 10)
+    # Use scrolledtext.ScrolledText for automatic scrollbars
+    # Set wrap="none" to enable horizontal scrolling for long lines
+    output_area = scrolledtext.ScrolledText(settings_frame, wrap="none", font=monospace_font)
+    # --- END OF CRITICAL CHANGE ---
     output_area.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
 
     graph_container = ttk.Frame(output_frame)
@@ -198,6 +220,7 @@ def create_layout(app, interfaces):
     return {
         "entries": entries,
         "latency_label": latency_label,
+        "remote_mac_label": remote_mac_label,
         "iface_var": iface_var,
         "profile_var": profile_var,
         "traffic_var": traffic_var,
