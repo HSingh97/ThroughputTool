@@ -149,7 +149,8 @@ def main():
                 ui_refs,
                 data_store,
                 graph,
-                update_metrics=update_metrics
+                update_metrics=update_metrics,
+                verbose_logging=False
             )
 
         test_runner['instance'] = tester
