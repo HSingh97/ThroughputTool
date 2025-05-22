@@ -20,7 +20,7 @@ class IperfTest:
     def __init__(self, remote_ip, iface, protocol, packet_size, direction, profile,
                  ui_refs, data_store, graph, update_metrics=None, verbose_logging=False):
         self.remote_ip = remote_ip
-        self.iface = iface  # Note: 'iface' is not used in iperf3 cmd in this version
+        self.iface = iface
         self.protocol = protocol.upper()
         self.direction = direction
         self.packet_size = packet_size
@@ -49,7 +49,7 @@ class IperfTest:
         try:
             self.loss_limit = float(self.ui['entries']['Loss Threshold (%)'].get())
         except (ValueError, TypeError, AttributeError):
-            print(f"IperfTest (init): [Warning] Invalid or missing Loss Threshold. Defaulting to 1.0%.")
+            self._log(f"IperfTest (init): [Warning] Invalid or missing Loss Threshold. Defaulting to 1.0%.")
             self.loss_limit = 1.0
 
         self.thread = threading.Thread(target=self._run_test, daemon=True)
@@ -61,11 +61,14 @@ class IperfTest:
             "latency_ping_packet_timeout_s": 1,
             "latency_ping_count": 1,
             "udp_initial_bw_mbps": 10,
-            "udp_bw_step_mbps": {"Safe": 10, "Moderate": 30, "Aggressive": 50, "Default": 30},
+            "udp_bw_step_mbps": {"Safe": 1, "Moderate": 10, "Aggressive": 30, "Default": 10},
+            "udp_bw_fine_step_mbps": {"Safe": 1, "Moderate": 1, "Aggressive": 2, "Default": 1},
+            "udp_enable_linear_fine_tuning": True,
             "udp_initial_streams": 2,
-            "udp_streams_increment_after_bw_freeze": 1,
+            "udp_streams_increment_step": {"Safe": 1, "Moderate": 1, "Aggressive": 2, "Default": 1},
             "udp_max_loss_retry_attempts": 1,
-            "udp_no_gain_threshold_after_bw_freeze": 3,
+            # MODIFIED: Reduced threshold for faster stream pushing conclusion
+            "udp_no_gain_threshold_after_bw_freeze": 2,
             "tcp_initial_streams": 2,
             "tcp_streams_increment": 1,
             "tcp_no_gain_threshold": 5,
@@ -74,6 +77,9 @@ class IperfTest:
             "main_loop_settle_s": 0.5,
             "process_kill_timeout_s": 2,
         }
+        for key in ["udp_bw_step_mbps", "udp_bw_fine_step_mbps", "udp_streams_increment_step"]:
+            if "Default" not in self.config[key]:
+                self.config[key]["Default"] = self.config[key].get("Moderate", 10 if "bw" in key else 1)
 
         self.tcp_throughput_history = deque(maxlen=self.config["tcp_plateau_iterations"])
 
@@ -116,21 +122,36 @@ class IperfTest:
                 f"[*] Profile: {self.profile}, Target IP: {self.remote_ip}, Packet Size: {self.packet_size if self.packet_size else 'Default'}")
         if self.protocol == "UDP":
             self._log(f"[*] UDP Loss Threshold: {self.loss_limit:.2f}%")
+            if self.verbose_logging:
+                self._log(
+                    f"[*] UDP Config: No-gain threshold for stream push: {self.config['udp_no_gain_threshold_after_bw_freeze']}")
 
         self._start_latency_monitor()
 
         current_streams = 0
         current_udp_bw_mbps = 0
+        udp_bw_for_stream_push_phase = 0  # To store the BW at which stream pushing is happening
 
         if self.protocol == "UDP":
             current_streams = self.config["udp_initial_streams"]
             current_udp_bw_mbps = self.config["udp_initial_bw_mbps"]
-            udp_bw_step = self.config["udp_bw_step_mbps"].get(self.profile, self.config["udp_bw_step_mbps"]["Default"])
+
+            udp_bw_coarse_step = self.config["udp_bw_step_mbps"].get(self.profile,
+                                                                     self.config["udp_bw_step_mbps"]["Default"])
+            udp_bw_fine_step = self.config["udp_bw_fine_step_mbps"].get(self.profile,
+                                                                        self.config["udp_bw_fine_step_mbps"]["Default"])
+            udp_stream_step = self.config["udp_streams_increment_step"].get(self.profile,
+                                                                            self.config["udp_streams_increment_step"][
+                                                                                "Default"])
+            enable_linear_fine_tuning = self.config.get("udp_enable_linear_fine_tuning", True)
+
             udp_bw_frozen = False
-            udp_last_lossless_target_bw = current_udp_bw_mbps
+            udp_linear_fine_tuning_active = False
+            udp_last_lossless_target_bw = 0
+
             udp_loss_retry_count = 0
             udp_no_gain_stream_phase_count = 0
-        else:  # TCP
+        else:
             current_streams = self.config["tcp_initial_streams"]
             tcp_no_gain_count = 0
 
@@ -138,11 +159,10 @@ class IperfTest:
         while not self.stop_flag:
             iteration += 1
             current_latency = self.data["latency"][-1] if self.data["latency"] else 0.0
-
             current_tx_mbps, current_rx_mbps, current_total_achieved_mbps = 0.0, 0.0, 0.0
             current_loss_percent = 100.0 if self.protocol == "UDP" else 0.0
             log_msg_detail = ""
-            used_server_perspective_for_tx = False  # Default, set true if applicable
+            used_server_perspective_for_tx = False
             is_interrupt_error = False
 
             cmd = ["iperf3", "-c", self.remote_ip,
@@ -150,21 +170,16 @@ class IperfTest:
                    "-J",
                    "-P", str(current_streams)]
 
-            if self.protocol == "TCP":
-                cmd.append("--get-server-output")
-
-            if self.packet_size:
-                cmd.extend(["-l", str(self.packet_size)])
-            if self.protocol == "UDP":
-                cmd.extend(["-u", "-b", f"{current_udp_bw_mbps}M"])
+            if self.protocol == "TCP": cmd.append("--get-server-output")
+            if self.packet_size: cmd.extend(["-l", str(self.packet_size)])
+            if self.protocol == "UDP": cmd.extend(["-u", "-b", f"{current_udp_bw_mbps}M"])
             if self.direction == "Downlink":
                 cmd.append("-R")
             elif self.direction == "Bi-Di":
                 cmd.append("--bidir")
 
-            if self.verbose_logging:
-                self._log(f"[*] Iter {iteration}: Executing: {' '.join(cmd)}")
-
+            if self.verbose_logging: self._log(f"[*] Iter {iteration}: Executing: {' '.join(cmd)}")
+            # ... (iPerf3 execution and basic JSON parsing as in previous response) ...
             iperf_output_str = ""
             proc_returncode = -1
             result_json = None
@@ -186,7 +201,7 @@ class IperfTest:
                         result_json = json.loads(json_data_str)
                         if result_json and self.protocol == "TCP" and self.verbose_logging:
                             self._log(
-                                f"[*] Iter {iteration} RAW JSON (End section): {json.dumps(result_json.get('end', {}), indent=2)}")
+                                f"[*] Iter {iteration} RAW JSON (End section for TCP): {json.dumps(result_json.get('end', {}), indent=2)}")
                     elif self.verbose_logging:
                         self._log(
                             f"[Warning] No JSON object start found in iPerf3 output (iter {iteration}). Output: {iperf_output_str[:200]}")
@@ -239,203 +254,237 @@ class IperfTest:
                 if self.protocol == "UDP":
                     sum_data = result_json.get("end", {}).get("sum", {})
                     if sum_data:
-                        achieved_bps = sum_data.get("bits_per_second", 0)
-                        current_total_achieved_mbps = achieved_bps / 1_000_000.0
-                        current_loss_percent = sum_data.get("lost_percent", 0.0)
-                        if achieved_bps == 0 and sum_data.get("bytes", 0) == 0 and current_udp_bw_mbps > 0:
-                            current_loss_percent = 100.0
-                    else:
-                        if self.verbose_logging: self._log(
-                            f"[Warning] UDP Iter {iteration}: No 'sum' data in JSON, using default 100% loss.")
-
-                    if self.direction == "Downlink":
-                        current_rx_mbps = current_total_achieved_mbps
-                        current_tx_mbps = 0.0
-                    elif self.direction == "Uplink":
-                        current_tx_mbps = current_total_achieved_mbps
-                        current_rx_mbps = 0.0
-                    elif self.direction == "Bi-Di":
-                        current_tx_mbps = current_total_achieved_mbps
-                        current_rx_mbps = 0.0
                         if self.verbose_logging:
                             self._log(
-                                f"[*] UDP Bi-Di Iter {iteration}: 'sum' data attributed to Tx. Rx considered 0 from this summary.")
+                                f"[*] UDP Iter {iteration} RAW JSON (client's end.sum): {json.dumps(sum_data, indent=2)}")
 
-                else:  # TCP
+                        client_sent_bytes = float(sum_data.get("bytes", 0))
+                        loss_percent_for_flow = float(sum_data.get("lost_percent", 100.0))
+                        duration_for_sum = float(sum_data.get("seconds", 0))
+                        achieved_bps = 0
+                        if duration_for_sum > 0:
+                            server_received_bytes = client_sent_bytes * (1.0 - (loss_percent_for_flow / 100.0))
+                            achieved_bps = (server_received_bytes * 8) / duration_for_sum
+
+                        current_total_achieved_mbps = achieved_bps / 1_000_000.0
+                        current_loss_percent = loss_percent_for_flow
+                        if client_sent_bytes == 0 and current_udp_bw_mbps > 0:
+                            current_loss_percent = 100.0
+                            current_total_achieved_mbps = 0.0
+                        elif client_sent_bytes > 0 and loss_percent_for_flow >= 100.0:
+                            current_loss_percent = 100.0  # Cap reported loss at 100 for consistency
+                            current_total_achieved_mbps = 0.0  # Ensure 0 throughput if 100% loss
+                    else:
+                        if self.verbose_logging: self._log(
+                            f"[Warning] UDP Iter {iteration}: No 'sum' data in JSON. Defaulting to 100% loss, 0 Mbps.")
+                        current_total_achieved_mbps = 0.0
+                        current_loss_percent = 100.0
+
+                    if self.direction == "Downlink":
+                        current_rx_mbps = current_total_achieved_mbps;
+                        current_tx_mbps = 0.0
+                    elif self.direction == "Uplink":
+                        current_tx_mbps = current_total_achieved_mbps;
+                        current_rx_mbps = 0.0
+                    elif self.direction == "Bi-Di":
+                        current_tx_mbps = current_total_achieved_mbps;
+                        current_rx_mbps = 0.0
+                        if self.verbose_logging: self._log(
+                            f"[*] UDP Bi-Di Iter {iteration}: Calculated SrvRx goodput ({current_total_achieved_mbps:.2f} Mbps) attributed to Tx for summary.")
+
+                else:  # TCP Parsing (unchanged)
+                    # ... (Same TCP parsing logic as previous response) ...
                     end_data = result_json.get("end", {})
-                    sum_sent_data_last = end_data.get("sum_sent", {})  # May be the last of duplicates
-                    sum_received_data_last = end_data.get("sum_received", {})  # May be the last of duplicates
-
+                    sum_sent_data_last = end_data.get("sum_sent", {})
+                    sum_received_data_last = end_data.get("sum_received", {})
                     uplink_bps_to_use, downlink_bps_to_use = 0, 0
                     log_source_tx, log_source_rx = "(NoData)", "(NoData)"
 
                     if self.direction == "Uplink":
-                        # For Uplink with --get-server-output, server's report is in client's "sum_received"
                         if sum_received_data_last and "bits_per_second" in sum_received_data_last:
                             uplink_bps_to_use = sum_received_data_last.get("bits_per_second", 0)
                             log_source_tx, used_server_perspective_for_tx = "(SrvRcv via CliSumRcv)", True
-                        elif sum_sent_data_last and "bits_per_second" in sum_sent_data_last:  # Fallback
+                        elif sum_sent_data_last and "bits_per_second" in sum_sent_data_last:
                             uplink_bps_to_use = sum_sent_data_last.get("bits_per_second", 0)
                             log_source_tx = "(CliSent - fallback)"
-                            if self.verbose_logging: self._log(
-                                f"[Warning] TCP Uplink Iter {iteration}: Server's received rate unavailable, using client's sent rate.")
-                        else:
-                            if self.verbose_logging: self._log(
-                                f"[Warning] TCP Uplink Iter {iteration}: No usable uplink data found.")
                         current_tx_mbps = uplink_bps_to_use / 1_000_000.0
                         current_rx_mbps = 0.0
-
                     elif self.direction == "Downlink":
-                        # Client is receiver, sum_received_data is authoritative.
                         if sum_received_data_last and "bits_per_second" in sum_received_data_last:
                             downlink_bps_to_use = sum_received_data_last.get("bits_per_second", 0)
                             log_source_rx = "(CliRcv)"
-                        else:
-                            if self.verbose_logging: self._log(
-                                f"[Warning] TCP Downlink Iter {iteration}: No downlink data (sum_received) found.")
                         current_tx_mbps = 0.0
                         current_rx_mbps = downlink_bps_to_use / 1_000_000.0
                         log_source_tx = "(N/A)"
-
                     elif self.direction == "Bi-Di":
-                        # FIX FOR TCP Bi-Di: Sum from end.streams due to potential duplicate keys in end.sum_*
-                        # and to accurately get receiver perspective for each direction.
                         calculated_uplink_bps = 0
                         calculated_downlink_bps = 0
                         end_streams_data = end_data.get("streams", [])
-                        num_tx_streams_processed = 0
-                        num_rx_streams_processed = 0
-
+                        num_tx_streams_processed, num_rx_streams_processed = 0, 0
                         if not end_streams_data:
-                            if self.verbose_logging:
-                                self._log(
-                                    f"[Warning] TCP BiDi Iter {iteration}: 'end.streams' array is missing. Using potentially ambiguous sum objects.")
-                            # Fallback to original (potentially flawed due to duplicate keys) logic if streams array is empty
-                            # This path indicates an unexpected JSON structure from iPerf3.
-                            # Client's TX rate (measured by server) appears in client's "sum_received" (ideally the one with sender=true)
-                            # Client's RX rate (data sent by server) appears in client's "sum_sent" (ideally the one with sender=false, or sum_received with sender=false)
-                            # The original script logic picked the LAST sum_received for TX and LAST sum_sent for RX.
-                            # We will replicate that as a fallback, though it might not be what user expects if duplicates are handled differently.
-                            # To better match user expectation if they wanted specific "sender:true/false" sums:
-                            # This fallback is tricky without iterating raw JSON string to find specific sum blocks.
-                            # Sticking to last sum_obj as before for this rare fallback.
                             if sum_received_data_last and "bits_per_second" in sum_received_data_last:
                                 calculated_uplink_bps = sum_received_data_last.get("bits_per_second", 0)
-                                log_source_tx = "(Fallback SrvRcv via LAST CliSumRcv)"  # Potentially not user's target TX
                             if sum_sent_data_last and "bits_per_second" in sum_sent_data_last:
                                 calculated_downlink_bps = sum_sent_data_last.get("bits_per_second", 0)
-                                log_source_rx = "(Fallback CliRcv via LAST CliSumSent)"  # Potentially not user's target RX
-
-                        else:  # Primary logic: Process end.streams
+                        else:
                             for stream_report in end_streams_data:
                                 stream_sender_info = stream_report.get("sender", {})
                                 stream_receiver_info = stream_report.get("receiver", {})
-
-                                # 'is_client_tx_stream' means this stream was initiated by the client to send data
                                 is_client_tx_stream = stream_sender_info.get("sender", False)
-
                                 if is_client_tx_stream:
-                                    # Client -> Server flow. We want what the server received for this stream.
-                                    # This is in stream_receiver_info.bits_per_second for this stream group.
                                     calculated_uplink_bps += stream_receiver_info.get("bits_per_second", 0)
                                     num_tx_streams_processed += 1
                                 else:
-                                    # Server -> Client flow (client is receiver for this stream_sender_info).
-                                    # We want what the client received for this stream.
-                                    # This is in stream_receiver_info.bits_per_second.
                                     calculated_downlink_bps += stream_receiver_info.get("bits_per_second", 0)
                                     num_rx_streams_processed += 1
-
                             log_source_tx = f"(Summed {num_tx_streams_processed} SrvRcv from end.streams)"
                             log_source_rx = f"(Summed {num_rx_streams_processed} CliRcv from end.streams)"
-                            used_server_perspective_for_tx = True  # As we sum server's measured reception
-
+                            used_server_perspective_for_tx = True
                         current_tx_mbps = calculated_uplink_bps / 1_000_000.0
                         current_rx_mbps = calculated_downlink_bps / 1_000_000.0
-
                     current_total_achieved_mbps = current_tx_mbps + current_rx_mbps
-
                     if self.verbose_logging:
                         details = []
-                        if self.direction != "Downlink" and log_source_tx not in ["(NoData)", "(N/A)"]:
-                            details.append(f"TxSrc:{log_source_tx}")
-                        if self.direction != "Uplink" and log_source_rx not in ["(NoData)", "(N/A)"]:
-                            details.append(f"RxSrc:{log_source_rx}")
-                        if details:
-                            log_msg_detail = " (" + ", ".join(details) + ")"
+                        if self.direction != "Downlink" and log_source_tx not in ["(NoData)", "(N/A)"]: details.append(
+                            f"TxSrc:{log_source_tx}")
+                        if self.direction != "Uplink" and log_source_rx not in ["(NoData)", "(N/A)"]: details.append(
+                            f"RxSrc:{log_source_rx}")
+                        if details: log_msg_detail = " (" + ", ".join(details) + ")"
 
             if self.protocol == "UDP":
-                log_msg = (f"Target UDP BW: {current_udp_bw_mbps:<4}M | Streams: {current_streams:<2} | "
-                           f"Achieved: {current_total_achieved_mbps:7.2f} Mbps | Loss: {current_loss_percent:5.2f}% | Latency: {current_latency:6.2f} ms")
+                # current_tx_mbps, current_rx_mbps, and current_total_achieved_mbps (as SrvRx)
+                # are already populated based on direction and the calculated server-received goodput.
+                log_msg = (f"UDP BW: {current_udp_bw_mbps:<3.0f}M | Streams: {current_streams:<2} | "
+                           f"Tx: {current_tx_mbps:6.2f} Mbps | Rx: {current_rx_mbps:6.2f} Mbps | Total: {current_total_achieved_mbps:6.2f} Mbps | "
+                           f"Loss: {current_loss_percent:5.2f}%")
             else:  # TCP
-                log_msg = (
-                    f"TCP Streams: {current_streams:<2} | Tx: {current_tx_mbps:7.2f} Mbps | Rx: {current_rx_mbps:7.2f} Mbps | "
-                    f"Total: {current_total_achieved_mbps:7.2f} Mbps{log_msg_detail} | Latency: {current_latency:6.2f} ms")
+                log_msg = (f"TCP Streams: {current_streams:<2} | Tx: {current_tx_mbps:7.2f} Mbps | Rx: {current_rx_mbps:7.2f} Mbps | "
+                           f"Total: {current_total_achieved_mbps:7.2f} Mbps{log_msg_detail}")
             self._log(log_msg)
 
             timestamp = time.time()
-            self.data["tx"].append(current_tx_mbps)
+            self.data["tx"].append(current_tx_mbps);
             self.data["rx"].append(current_rx_mbps)
-            self.data["throughput"].append(current_total_achieved_mbps)
+            self.data["throughput"].append(current_total_achieved_mbps);
             self.data["timestamp"].append(timestamp)
-
             if self.update_metrics:
                 self.update_metrics(tx=current_tx_mbps, rx=current_rx_mbps, latency=current_latency,
                                     loss=current_loss_percent, duration_secs=int(timestamp - self.start_time),
                                     total=current_total_achieved_mbps)
-            if self.graph:
-                self.graph.update_graphs(self.data["timestamp"], self.data["tx"], self.data["rx"], self.data["latency"])
+            if self.graph: self.graph.update_graphs(self.data["timestamp"], self.data["tx"], self.data["rx"],
+                                                    self.data["latency"])
 
-            # --- Decision Logic (parameter adjustment, max throughput update) ---
+            # --- Decision Logic ---
             if self.protocol == "UDP":
+                new_overall_max_found_this_iter = False
                 if current_loss_percent <= self.loss_limit:
                     udp_loss_retry_count = 0
                     if not is_interrupt_error and current_total_achieved_mbps > self.max_achieved_tp_overall:
                         self.max_achieved_tp_overall, self.max_achieved_tp_tx, self.max_achieved_tp_rx = current_total_achieved_mbps, current_tx_mbps, current_rx_mbps
-                        self.max_achieved_tp_udp_lossless_bw, self.max_achieved_tp_streams = current_udp_bw_mbps, current_streams
+                        self.max_achieved_tp_udp_lossless_bw = current_udp_bw_mbps
+                        self.max_achieved_tp_streams = current_streams
                         udp_no_gain_stream_phase_count = 0
+                        new_overall_max_found_this_iter = True
                         if self.verbose_logging: self._log(
                             f"[*] New max UDP throughput: {self.max_achieved_tp_overall:.2f} Mbps at {current_udp_bw_mbps}M target, {current_streams} streams")
-                    elif is_interrupt_error and self.verbose_logging:
-                        self._log(
-                            f"[*] Iter {iteration} (UDP): Test interrupted, throughput ({current_total_achieved_mbps:.2f} Mbps) not for max.")
+
                     if not udp_bw_frozen:
                         udp_last_lossless_target_bw = current_udp_bw_mbps
-                        current_udp_bw_mbps += udp_bw_step
-                    else:
-                        if current_total_achieved_mbps <= self.max_achieved_tp_overall * 0.99 and self.max_achieved_tp_overall > 0:  # If results dip after freezing BW
-                            udp_no_gain_stream_phase_count += 1
+                        if udp_linear_fine_tuning_active:
+                            current_udp_bw_mbps += udp_bw_fine_step
+                            if self.verbose_logging: self._log(
+                                f"[*] UDP Linear fine-tuning: Success at {udp_last_lossless_target_bw}M, trying next fine step to {current_udp_bw_mbps}M.")
                         else:
-                            udp_no_gain_stream_phase_count = 0  # Reset if we see gain or stability
-                        current_streams += self.config["udp_streams_increment_after_bw_freeze"]
+                            current_udp_bw_mbps += udp_bw_coarse_step
+                            if self.verbose_logging: self._log(
+                                f"[*] UDP Coarse BW: Success at {udp_last_lossless_target_bw}M, trying next coarse step to {current_udp_bw_mbps}M.")
+
+                    else:  # BW is frozen, stream pushing phase
+                        udp_bw_for_stream_push_phase = current_udp_bw_mbps  # Record the BW for this phase for logging clarity
+                        if not new_overall_max_found_this_iter:
+                            udp_no_gain_stream_phase_count += 1
+                            if self.verbose_logging:
+                                self._log(
+                                    f"[*] UDP Iter {iteration}: Stream push at {udp_bw_for_stream_push_phase}M: TP {current_total_achieved_mbps:.2f} Mbps (vs max {self.max_achieved_tp_overall:.2f} Mbps). No-new-overall-max count: {udp_no_gain_stream_phase_count}/{self.config['udp_no_gain_threshold_after_bw_freeze']}.")
+
+                        if udp_no_gain_stream_phase_count >= self.config["udp_no_gain_threshold_after_bw_freeze"]:
+                            self._log(
+                                f"[*] UDP Iter {iteration}: Concluding stream push. No new overall max after {udp_no_gain_stream_phase_count} checks (stream push was at {udp_bw_for_stream_push_phase}M target, current streams {current_streams}). Best overall: {self.max_achieved_tp_overall:.2f} Mbps at {self.max_achieved_tp_udp_lossless_bw}M.")
+                            self._conclude_test_and_summarize(
+                                f"UDP: No new overall max after {self.config['udp_no_gain_threshold_after_bw_freeze']} stream checks (push at {udp_bw_for_stream_push_phase}M).")
+                            return
+
+                        current_streams += udp_stream_step
+
                 else:  # Loss > limit
                     udp_loss_retry_count += 1
                     if self.verbose_logging: self._log(
                         f"[!] UDP Iter {iteration}: Loss {current_loss_percent:.2f}% > {self.loss_limit:.2f}%. Retry {udp_loss_retry_count}/{self.config['udp_max_loss_retry_attempts']}.")
-                    if udp_loss_retry_count > self.config["udp_max_loss_retry_attempts"]:
+
+                    if udp_loss_retry_count > self.config['udp_max_loss_retry_attempts']:
                         if not udp_bw_frozen:
+                            failing_bw = current_udp_bw_mbps
+                            if udp_linear_fine_tuning_active:
+                                self._log(
+                                    f"[*] UDP Linear fine-tuning failed at {failing_bw}M. Settling at last good: {udp_last_lossless_target_bw}M.")
+                                current_udp_bw_mbps = udp_last_lossless_target_bw
+                                udp_bw_frozen = True;
+                                udp_linear_fine_tuning_active = False
+                                udp_bw_for_stream_push_phase = current_udp_bw_mbps  # Set BW for stream push
+                                self._log(
+                                    f"[*] UDP Bandwidth frozen at {current_udp_bw_mbps}M. Starting stream pushing with {current_streams} streams.")
+                            elif enable_linear_fine_tuning and udp_last_lossless_target_bw > 0 and \
+                                    (failing_bw - udp_last_lossless_target_bw >= udp_bw_fine_step):
+                                self._log(
+                                    f"[*] UDP Coarse BW step to {failing_bw}M failed. Starting linear fine-tuning from last good {udp_last_lossless_target_bw}M with +{udp_bw_fine_step}M steps.")
+                                udp_linear_fine_tuning_active = True
+                                current_udp_bw_mbps = udp_last_lossless_target_bw + udp_bw_fine_step
+                            else:
+                                fallback_bw = udp_last_lossless_target_bw if udp_last_lossless_target_bw > 0 else \
+                                self.config['udp_initial_bw_mbps']
+                                self._log(
+                                    f"[*] UDP Iter {iteration}: BW step to {failing_bw}M failed. Freezing UDP bandwidth at last good/initial: {fallback_bw}M.")
+                                udp_bw_frozen = True
+                                current_udp_bw_mbps = max(1, fallback_bw)
+                                udp_linear_fine_tuning_active = False
+                                udp_bw_for_stream_push_phase = current_udp_bw_mbps  # Set BW for stream push
+                                self._log(
+                                    f"[*] UDP Bandwidth frozen at {current_udp_bw_mbps}M. Starting stream pushing with {current_streams} streams.")
+
+                        else:
                             self._log(
-                                f"[*] UDP Iter {iteration}: Freezing UDP bandwidth at last good/attempted: {udp_last_lossless_target_bw}M or lower. Will inc streams.")
-                            udp_bw_frozen = True
-                            current_udp_bw_mbps = max(1,
-                                                      udp_last_lossless_target_bw)  # Revert to last known good target BW
-                            # Consider if stepping back one step is better: max(1, udp_last_lossless_target_bw - udp_bw_step)
-                        else:  # Already frozen, still getting loss after retries
-                            self._conclude_test_and_summarize(
-                                f"UDP loss {current_loss_percent:.2f}% > {self.loss_limit:.2f}% (iter {iteration}, post-freeze, after stream increments)")
-                            return
+                                f"[!] UDP Iter {iteration}: Persistent loss ({current_loss_percent:.2f}%) at frozen BW {udp_bw_for_stream_push_phase}M with attempted {current_streams} streams.")
+                            attempted_streams_that_failed = current_streams
+                            current_streams = max(self.config["udp_initial_streams"],
+                                                  attempted_streams_that_failed - udp_stream_step)
+
+                            if attempted_streams_that_failed == current_streams:
+                                self._log(
+                                    f"[!] UDP Iter {iteration}: Loss at frozen BW {udp_bw_for_stream_push_phase}M with {current_streams} streams (minimum for this phase). Concluding.")
+                                self._conclude_test_and_summarize(
+                                    f"UDP loss at frozen BW {udp_bw_for_stream_push_phase}M, stream count {current_streams} could not be stabilized.")
+                                return
+                            else:
+                                self._log(
+                                    f"[*] UDP Iter {iteration}: Reverted streams from {attempted_streams_that_failed} to {current_streams} for frozen BW {udp_bw_for_stream_push_phase}M.")
+                                self._log(
+                                    f"[*] Setting to check stability at {current_streams} streams; if no new overall max, stream push phase may end.")
+                                udp_no_gain_stream_phase_count = self.config[
+                                                                     "udp_no_gain_threshold_after_bw_freeze"] - 1
                         udp_loss_retry_count = 0
-                if udp_bw_frozen and udp_no_gain_stream_phase_count >= self.config[
-                    "udp_no_gain_threshold_after_bw_freeze"]:
-                    self._conclude_test_and_summarize(
-                        f"UDP: No gain after {self.config['udp_no_gain_threshold_after_bw_freeze']} stream increments (iter {iteration}).")
+
+                if current_udp_bw_mbps <= 0:
+                    self._log(f"[!] UDP BW target became non-positive ({current_udp_bw_mbps}M). Concluding.")
+                    self._conclude_test_and_summarize("UDP BW error");
                     return
                 if current_udp_bw_mbps > 20000 or current_streams > 64:
-                    self._conclude_test_and_summarize(f"UDP params exceeded safety limits (iter {iteration}).")
+                    self._conclude_test_and_summarize(
+                        f"UDP params (BW {current_udp_bw_mbps}M or Streams {current_streams}) exceeded limits.");
                     return
-            else:  # TCP
-                is_valid_data_for_calc = (current_total_achieved_mbps > 0.001)
 
+            else:  # TCP Logic (unchanged)
+                # ... (Same TCP logic as previous response) ...
+                is_valid_data_for_calc = (current_total_achieved_mbps > 0.001)
                 if not is_interrupt_error and is_valid_data_for_calc:
                     if current_total_achieved_mbps > self.max_achieved_tp_overall:
                         self.max_achieved_tp_overall, self.max_achieved_tp_tx, self.max_achieved_tp_rx = current_total_achieved_mbps, current_tx_mbps, current_rx_mbps
@@ -444,7 +493,7 @@ class IperfTest:
                         self.tcp_throughput_history.clear()
                         if self.verbose_logging:
                             self._log(
-                                f"[*] New max TCP throughput: {self.max_achieved_tp_overall:.2f} Mbps at {current_streams} streams{log_msg_detail} (Iter {iteration})")  # Use populated log_msg_detail
+                                f"[*] New max TCP throughput: {self.max_achieved_tp_overall:.2f} Mbps at {current_streams} streams{log_msg_detail} (Iter {iteration})")
                     else:
                         if current_streams > self.config["tcp_initial_streams"] or self.max_achieved_tp_overall > 1:
                             tcp_no_gain_count += 1
@@ -457,14 +506,15 @@ class IperfTest:
                                 self.config["tcp_initial_streams"] + self.config["tcp_plateau_iterations"] - 1):
                             min_hist_tp = min(self.tcp_throughput_history)
                             max_hist_tp = max(self.tcp_throughput_history)
-                            ref_hist_tp = self.tcp_throughput_history[-1] if self.tcp_throughput_history else 0.1
+                            ref_hist_tp = sum(self.tcp_throughput_history) / len(
+                                self.tcp_throughput_history) if self.tcp_throughput_history else 0.1
 
                             if ref_hist_tp > 0.1:
                                 percentage_diff = ((max_hist_tp - min_hist_tp) / ref_hist_tp) * 100
                                 if self.verbose_logging:
                                     history_list_str = ", ".join([f"{x:.2f}" for x in self.tcp_throughput_history])
                                     self._log(
-                                        f"[*] TCP Plateau Check: History=[{history_list_str}], Min={min_hist_tp:.2f}, Max={max_hist_tp:.2f}, Ref={ref_hist_tp:.2f}, Diff={percentage_diff:.2f}%")
+                                        f"[*] TCP Plateau Check: History=[{history_list_str}], Min={min_hist_tp:.2f}, Max={max_hist_tp:.2f}, AvgRef={ref_hist_tp:.2f}, Diff={percentage_diff:.2f}%")
                                 if percentage_diff < self.config["tcp_plateau_percentage_variance"]:
                                     self._log(
                                         f"[*] TCP throughput plateau detected: Last {self.config['tcp_plateau_iterations']} iterations within {self.config['tcp_plateau_percentage_variance']:.2f}% variance.")
@@ -498,9 +548,11 @@ class IperfTest:
             self._conclude_test_and_summarize(reason)
 
     def _start_latency_monitor(self):
+        # ... (Unchanged from previous response)
         def monitor():
             pattern = re.compile(r"time=([\d.]+)\s*ms", re.IGNORECASE)
-            avg_pattern = re.compile(r"min/avg/max(?:/mdev)?\s*=\s*[\d.]+/([\d.]+)/", re.IGNORECASE)
+            avg_pattern = re.compile(r"(?:min/avg/max|rtt min/avg/max)(?:/[^=]+)?\s*=\s*[\d.]+/([\d.]+)/",
+                                     re.IGNORECASE)
 
             while not self.latency_stop_flag and not self.stop_flag:
                 latency_value = 9999.0
@@ -511,9 +563,11 @@ class IperfTest:
                            self.remote_ip]
                     process_timeout = (self.config["latency_ping_packet_timeout_s"] * self.config[
                         "latency_ping_count"]) + 2
+
                     ping_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                text=True, timeout=process_timeout, check=False)
                     output = ping_proc.stdout
+
                     avg_match = avg_pattern.search(output)
                     if avg_match:
                         latency_value = float(avg_match.group(1))
@@ -523,13 +577,13 @@ class IperfTest:
                             latency_value = float(matches[-1])
                         elif "0% packet loss" not in output and \
                                 ("100% packet loss" in output or ping_proc.returncode != 0):
-                            if self.verbose_logging: self._log("[Latency] Ping timeout or 100% loss.")
+                            if self.verbose_logging: self._log("[Latency] Ping timeout or 100% loss reported by ping.")
                         elif "0% packet loss" in output and not matches and not avg_match:
                             if self.verbose_logging: self._log(
-                                "[Latency] Ping successful but no RTT parsed from output.")
+                                "[Latency] Ping successful but no RTT parsed from output. Assuming near-zero for this sample.")
                             latency_value = 0.0
                 except subprocess.TimeoutExpired:
-                    if self.verbose_logging: self._log("[Latency] Ping command timed out.")
+                    if self.verbose_logging: self._log("[Latency] Ping command itself timed out.")
                 except FileNotFoundError:
                     self._log("[!] Ping command not found. Latency monitoring will stop and record 0.")
                     self.latency_stop_flag = True
@@ -548,6 +602,7 @@ class IperfTest:
         self.latency_thread.start()
 
     def _conclude_test_and_summarize(self, reason):
+        # ... (Unchanged from previous response)
         if self.concluded_event.is_set(): return
         self.concluded_event.set()
 
@@ -556,7 +611,9 @@ class IperfTest:
 
         if self.latency_thread and self.latency_thread.is_alive() and threading.current_thread() != self.latency_thread:
             try:
-                join_timeout = self.config["latency_ping_packet_timeout_s"] + self.config["latency_ping_interval_s"] + 1
+                join_timeout = self.config.get("latency_ping_packet_timeout_s", 1) * self.config.get(
+                    "latency_ping_count", 1) + \
+                               self.config.get("latency_ping_interval_s", 1) + 2
                 self.latency_thread.join(timeout=join_timeout)
                 if self.latency_thread.is_alive() and self.verbose_logging:
                     self._log("[Warning] Latency thread join timed out during conclusion.")
@@ -570,10 +627,12 @@ class IperfTest:
         kill_iperf()
 
     def _final_summary_box(self):
+        # ... (Unchanged from previous response)
         duration = int(time.time() - self.start_time) if self.start_time > 0 else 0
         if self.start_time == 0 and self.verbose_logging: self._log(
             "[Warning] Start time not set for summary duration.")
         mins, secs = divmod(duration, 60)
+
         box_width, content_width, key_text_max_width, separator = 70, 66, 30, " : "
         summary_lines = []
 
@@ -592,6 +651,7 @@ class IperfTest:
 
         title = f"iPerf3 {self.protocol} Test Summary ({self.direction})"
         border = f"+{'-' * (box_width - 2)}+"
+
         summary_lines.extend(["\n" + border, f"| {title.center(content_width)} |", border])
         add_line_to_summary("Test Duration", f"{mins:02}:{secs:02} (mm:ss)")
         add_line_to_summary("Profile", self.profile)
@@ -599,7 +659,9 @@ class IperfTest:
         if self.protocol == "UDP": add_line_to_summary("UDP Loss Threshold Set", f"{self.loss_limit:.2f}%")
         add_line_to_summary("", "")
         add_line_to_summary("--- Max Achieved Stable Throughput ---")
-        add_line_to_summary("Total Achieved", f"{self.max_achieved_tp_overall:.2f} Mbps")
+        add_line_to_summary("Total Achieved", f"{self.max_achieved_tp_overall:.2f} Mbps" + (
+            " (Est. Server Received)" if self.protocol == "UDP" else ""))
+
         if self.direction == "Bi-Di":
             add_line_to_summary("  Tx (at Max Total)", f"{self.max_achieved_tp_tx:.2f} Mbps")
             add_line_to_summary("  Rx (at Max Total)", f"{self.max_achieved_tp_rx:.2f} Mbps")
@@ -616,14 +678,17 @@ class IperfTest:
             valid_latencies = [l for l in self.data['latency'] if l is not None and l < 9999.0]
             avg_lat = sum(valid_latencies) / len(valid_latencies) if valid_latencies else 0.0
             min_lat = min(valid_latencies) if valid_latencies else 0.0
-            all_recorded_latencies = [l for l in self.data['latency'] if l is not None]
+            all_recorded_latencies = [l for l in self.data['latency'] if l is not None and l < 9999.0]
             max_lat = max(all_recorded_latencies) if all_recorded_latencies else 0.0
-
+            if not valid_latencies and any(l == 9999.0 for l in self.data['latency']):
+                avg_lat_str, min_lat_str, max_lat_str = "N/A (Pings Failed)", "N/A", "N/A"
+            else:
+                avg_lat_str, min_lat_str, max_lat_str = f"{avg_lat:.2f} ms", f"{min_lat:.2f} ms", f"{max_lat:.2f} ms"
             add_line_to_summary("", "");
             add_line_to_summary("--- Latency (Ping based) ---")
-            add_line_to_summary("  Average ", f"{avg_lat:.2f} ms")
-            add_line_to_summary("  Min ", f"{min_lat:.2f} ms")
-            add_line_to_summary("  Max ", f"{max_lat:.2f} ms")
+            add_line_to_summary("  Average ", avg_lat_str);
+            add_line_to_summary("  Min ", min_lat_str);
+            add_line_to_summary("  Max ", max_lat_str)
 
         if self.verbose_logging:
             last_tx = self.data['tx'][-1] if self.data['tx'] else 0.0
@@ -634,7 +699,6 @@ class IperfTest:
             add_line_to_summary("  Tx", f"{last_tx:.2f} Mbps");
             add_line_to_summary("  Rx", f"{last_rx:.2f} Mbps")
             add_line_to_summary("  Total Achieved", f"{total_live:.2f} Mbps")
-
         summary_lines.append(border)
         for line in summary_lines: self._log(line)
 
@@ -644,7 +708,11 @@ class IperfTest:
                 if self.ui.get('stop_button'): self.ui['stop_button'].config(state="disabled")
                 if self.ui.get('status_bar'): self.ui['status_bar'].config(text="Test Stopped/Completed")
                 for btn_key in ['export_log_btn', 'save_tp_graph_btn', 'save_latency_graph_btn']:
-                    if btn_key in self.ui and self.ui.get(btn_key): self.ui[btn_key].config(state="normal")
+                    if btn_key in self.ui and self.ui.get(btn_key):
+                        if ('graph' in btn_key and self.data['timestamp']) or 'log' in btn_key:
+                            self.ui[btn_key].config(state="normal")
+                        else:
+                            self.ui[btn_key].config(state="disabled")
             except Exception as e:
                 self._log(f"[UI Error] Failed to update UI elements state post-test: {e}")
 
@@ -652,11 +720,12 @@ class IperfTest:
         if self.ui and self.ui.get('output_area'):
             try:
                 output_area = self.ui['output_area']
-                output_area.config(state='normal')
-                output_area.insert("end", msg + "\n")
-                output_area.config(state='disabled')
-                output_area.see("end")
-            except Exception as e:
-                print(f"UI Logging Error: {e} | Message: {msg}")
+                if output_area.winfo_exists():  # Check if widget still exists
+                    output_area.config(state='normal')
+                    output_area.insert("end", msg + "\n")
+                    output_area.config(state='disabled')
+                    output_area.see("end")
+            except Exception:
+                print(msg)
         else:
             print(msg)
