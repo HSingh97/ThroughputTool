@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+# backend-path = ["."]
+
+[project]
+name = "throughputtool"
+version = "0.1.0"  # Or your desired version
+description = "A GUI tool for testing network throughput and related metrics."
+readme = "README.md" # Create a README.md file if you haven't already
+requires-python = ">=3.7"
+license = { text = "MIT" } # Or your chosen license
+authors = [
+  { name = "Your Name", email = "your.email@example.com" }, # Replace with your details
+]
+keywords = ["network", "throughput", "iperf3", "ping", "l2", "gui", "tester"]
+
+dependencies = [
+  "ttkbootstrap",
+  "psutil",
+  "matplotlib",
+  "netifaces"
+]
+
+[project.scripts]
+throughput-tool = "throughputtool.main:main"
+
+[project.urls]
+Homepage = "https://github.com/HSingh97/ThroughputTool.git" # Replace with your actual URL if available
+Repository = "https://github.com/HSingh97/ThroughputTool.git"

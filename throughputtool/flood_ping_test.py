@@ -220,66 +220,70 @@ class FloodPingTest:
                 if loss_match: icmp_loss_this_cycle = float(loss_match.group(1))
                 if rtt_match: icmp_latency_this_cycle = float(rtt_match.group(1))
 
-                # Handle edge cases from ping output
                 if not loss_match and not rtt_match and "100% packet loss" in ping_output:
                     icmp_loss_this_cycle = 100.0
-                elif "0% packet loss" in ping_output and not rtt_match and not loss_match:  # Ensure loss_match is also checked
-                    # If 0% loss reported but no RTT, might indicate other issues, keep high latency
+                elif "0% packet loss" in ping_output and not rtt_match and not loss_match:
                     icmp_latency_this_cycle = 9999.0
-                    icmp_loss_this_cycle = 0.0  # Explicitly set loss if "0% packet loss" is present
-
+                    icmp_loss_this_cycle = 0.0
             except subprocess.TimeoutExpired:
                 if self.verbose_logging:
                     self._log("[!] Metrics ping command timed out. Assuming high latency/loss.")
                 ping_proc.kill()
-                # icmp_loss_this_cycle and icmp_latency_this_cycle remain at worst-case defaults
             except Exception as e:
                 self._log(f"[!] Error during metrics ping: {e}")
-                # icmp_loss_this_cycle and icmp_latency_this_cycle remain at worst-case defaults
 
             current_tx = self._get_if_rate('tx')
             current_rx = self._get_if_rate('rx')
             total_throughput = current_tx + current_rx
+            current_time = time.time() # Get current time regardless
 
-            current_time = time.time()
-            self.data["tx"].append(current_tx)
-            self.data["rx"].append(current_rx)
-            self.data["latency"].append(icmp_latency_this_cycle)  # Use metrics from this cycle
-            self.data["throughput"].append(total_throughput)
-            self.data["timestamp"].append(current_time)
+            # MODIFICATION START: Conditional data handling, graph update, and logging
+            if icmp_latency_this_cycle == 9999.0:
+                # If latency is 9999, do not append this data point for graphing
+                # and do not log the generic [+] status line for this iteration.
+                # The main decision logic below will still use this 9999ms latency value.
+                pass # Explicitly do nothing here for these specific actions
+            else:
+                # Latency is valid, so append data, update graph, and log the [+] status line
+                self.data["tx"].append(current_tx)
+                self.data["rx"].append(current_rx)
+                self.data["latency"].append(icmp_latency_this_cycle)
+                self.data["throughput"].append(total_throughput)
+                self.data["timestamp"].append(current_time)
 
-            if self.graph:
-                self.graph.update_graphs(self.data["timestamp"], self.data["tx"], self.data["rx"], self.data["latency"])
+                if self.graph:
+                    self.graph.update_graphs(self.data["timestamp"], self.data["tx"], self.data["rx"], self.data["latency"])
 
-            log_msg_status = (
-                f"[+] Instances: {self.current_instance_count:<3} | Tx: {current_tx:7.2f} Mbps | Rx: {current_rx:7.2f} Mbps | "
-                f"Latency: {icmp_latency_this_cycle:6.2f} ms | Loss: {icmp_loss_this_cycle:5.1f}%"
-            # Use metrics from this cycle
-            )
-            if self.fine_tuning: log_msg_status += " (Fine-tuning)"
-            if self.probing: log_msg_status += " (Probing)"
-            self._log(log_msg_status)
+                log_msg_status = (
+                    f"[+] Instances: {self.current_instance_count:<3} | Tx: {current_tx:7.2f} Mbps | Rx: {current_rx:7.2f} Mbps | "
+                    f"Latency: {icmp_latency_this_cycle:6.2f} ms | Loss: {icmp_loss_this_cycle:5.1f}%"
+                )
+                if self.fine_tuning: log_msg_status += " (Fine-tuning)"
+                if self.probing: log_msg_status += " (Probing)"
+                self._log(log_msg_status)
+            # MODIFICATION END
 
-            # Decision logic based on this cycle's metrics
+            # Decision logic based on this cycle's metrics (ALWAYS runs, using current icmp_latency_this_cycle)
             if icmp_latency_this_cycle > self.latency_limit or icmp_loss_this_cycle > self.loss_limit:
                 self.consecutive_exceed_count += 1
                 self.stable_count = 0
                 self.probing = False
 
                 if not self.fine_tuning:
+                    # This log is crucial and should appear even if the [+] line was suppressed
                     self._log(
                         f"[!] Limits exceeded (L:{icmp_latency_this_cycle:.2f}ms, P:{icmp_loss_this_cycle:.1f}%). Entering fine-tuning. Reducing instances.")
                     self.fine_tuning = True
                     reduction = self.config["initial_reduction_factor"]
                     self._adjust_ping_instances(self.current_instance_count - reduction)
-                else:
+                else: # Already in fine-tuning
                     if self.consecutive_exceed_count >= self.config["consecutive_exceed_threshold"]:
                         self._abort(
                             f"Failed to stabilize after {self.config['consecutive_exceed_threshold']} attempts during fine-tuning. "
                             f"Max Stable: {self.max_stable_instances} inst. ({self.max_stable_throughput:.2f} Mbps)",
                             start_time
                         )
-                        return
+                        return # Exit method after abort
                     if self.verbose_logging:
                         self._log(f"[!] Limits still exceeded during fine-tuning. Reducing instances further.")
                     reduction = self.config["fine_tune_reduction_factor"]
@@ -288,59 +292,49 @@ class FloodPingTest:
                 self.previous_loss = icmp_loss_this_cycle
                 self.previous_latency = icmp_latency_this_cycle
 
-                # Check if already at minimum instances and still failing
                 if self.current_instance_count <= self.config.get("min_instances_fallback", 1) and \
                         (icmp_latency_this_cycle > self.latency_limit or icmp_loss_this_cycle > self.loss_limit):
                     self._abort(f"Reduced to minimum instances ({self.current_instance_count}) but still unstable.",
                                 start_time)
-                    return
+                    return # Exit method after abort
             else:  # Within limits
-                self.consecutive_exceed_count = 0  # Reset exceed count
-                if total_throughput > self.max_stable_throughput:
+                self.consecutive_exceed_count = 0
+                if total_throughput > self.max_stable_throughput: # Check total_throughput, not current_rx
                     self.max_stable_throughput = total_throughput
                     self.max_stable_instances = self.current_instance_count
                     self.tx_at_max_throughput = current_tx
                     self.rx_at_max_throughput = current_rx
-                    #self._log(
-                    #    f"[*] New max stable throughput: {self.max_stable_throughput:.2f} Mbps at {self.max_stable_instances} instances.")
 
                 if self.fine_tuning:
                     self.stable_count += 1
                     if self.stable_count >= self.config["stability_threshold"]:
-                        if not self.probing:  # Just stabilized after exceeding limits
-                            self._log(
+                        if not self.probing:
+                            self._log( # This log message should still appear
                                 f"[+] Stabilized at {self.current_instance_count} instances ({total_throughput:.2f} Mbps) after fine-tuning. "
                                 f"Now probing for higher throughput..."
                             )
                             self.probing = True
                             self._adjust_ping_instances(
                                 self.current_instance_count + self.config["probe_increment_factor"])
-                            self.stable_count = 0  # Reset stable count for the new probed level
-                        else:  # Was already probing and this new probed level is stable
-                            self._log(
+                            self.stable_count = 0
+                        else:
+                            self._log( # This log message should still appear
                                 f"[+] Probed level ({self.current_instance_count} inst, {total_throughput:.2f} Mbps) is stable. "
                                 f"This is the current max sustainable."
                             )
                             self._abort(
                                 f"Test completed. Max Stable: {self.max_stable_instances} inst. ({self.max_stable_throughput:.2f} Mbps)",
                                 start_time)
-                            return
-                    else:  # Still in fine-tuning, accumulating stable counts
+                            return # Exit method after abort
+                    else:
                         if self.verbose_logging:
                             self._log(
                                 f"[*] Fine-tuning: Stable count {self.stable_count}/{self.config['stability_threshold']} at {self.current_instance_count} instances.")
-                        # No change in instances, wait for more stable readings
-
-                else:  # Not fine-tuning (initial ramp-up or probing that succeeded and is now stable)
+                else:  # Not fine-tuning (initial ramp-up or probing)
                     if self.probing:
-                        # This means we were probing, increased instances, and this new level is stable.
-                        # The current logic will make it enter the self.fine_tuning=True, self.probing=True, stable_count check above
-                        # on subsequent stable readings.
-                        # We can let it continue to gather stable_count at this probed level.
                         if self.verbose_logging:
                             self._log(
                                 f"[*] Probed level ({self.current_instance_count} inst.) is stable. Monitoring for stability threshold.")
-                        # It will go through the fine_tuning=True & probing=True path above once stable_count threshold is met.
                     else:  # Initial ramp-up phase
                         if self.verbose_logging:
                             self._log(f"[*] Ramp-up: Increasing instances by {ramp_up_increment}.")
@@ -350,13 +344,14 @@ class FloodPingTest:
                 self.previous_latency = icmp_latency_this_cycle
 
             # Plateau Detection
-            self.throughput_history.append(total_throughput)
+            self.throughput_history.append(total_throughput) # This still appends total_throughput even if latency was 9999
+                                                             # If plateau detection should also ignore these, this needs to move into the 'else' block too.
+                                                             # For now, keeping as per original structure relative to the main if/else for data.
             if not first_throughput_cycle and len(self.throughput_history) >= self.config["throughput_history_maxlen"]:
-                # Check for plateau only if not fine-tuning aggressively (or recently stabilized)
-                if not self.fine_tuning or self.stable_count > 1:  # Allow plateau check if stable or in general ramp up
+                if not self.fine_tuning or self.stable_count > 1:
                     avg_throughput_history = sum(self.throughput_history) / len(self.throughput_history) if len(
                         self.throughput_history) > 0 else 0
-                    if avg_throughput_history > 0:  # Avoid division by zero
+                    if avg_throughput_history > 0:
                         delta_throughput = max(self.throughput_history) - min(self.throughput_history)
                         percentage_change = (delta_throughput / avg_throughput_history) * 100
                         if percentage_change < self.config["plateau_percentage_threshold"]:
@@ -368,26 +363,21 @@ class FloodPingTest:
                             self._abort(
                                 f"Throughput plateau detected. Max stable: {self.max_stable_throughput:.2f} Mbps.",
                                 start_time)
-                            return
+                            return # Exit method after abort
 
             if first_throughput_cycle:
                 first_throughput_cycle = False
 
-            # === START: Modified Sleep Logic ===
-            if self.stop_flag: break  # Check stop_flag again before sleeping
+            if self.stop_flag: break
 
             current_loop_sleep = self.config["main_loop_sleep_s"]
-            # Condition for extended sleep:
             if self.fine_tuning and \
                     (icmp_latency_this_cycle > self.latency_limit or icmp_loss_this_cycle > self.loss_limit) and \
                     self.consecutive_exceed_count > 0:
-                current_loop_sleep += 1.0  # Add an extra second (configurable if needed)
+                current_loop_sleep += 1.0
                 if self.verbose_logging:
                     self._log(f"[*] Extended settling time to {current_loop_sleep:.1f}s due to fine-tuning stress.")
-
             time.sleep(current_loop_sleep)
-            # === END: Modified Sleep Logic ===
-
         # End of while loop
         self._final_summary(start_time)
 
