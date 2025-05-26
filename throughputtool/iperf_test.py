@@ -592,16 +592,22 @@ class IperfTest:
             self._log(log_msg)
 
             timestamp = time.time()  # Store and update metrics/graphs
-            self.data["tx"].append(current_tx_mbps);
-            self.data["rx"].append(current_rx_mbps)
+            self.data["local_tx"].append(current_tx_mbps);
+            self.data["local_rx"].append(current_rx_mbps)
             self.data["throughput"].append(current_total_achieved_mbps);
             self.data["timestamp"].append(timestamp)
             if self.update_metrics: self.update_metrics(tx=current_tx_mbps, rx=current_rx_mbps, latency=current_latency,
                                                         loss=current_loss_percent if self.protocol == "UDP" else 0.0,
                                                         duration_secs=int(timestamp - self.start_time),
                                                         total=current_total_achieved_mbps)
-            if self.graph: self.graph.update_graphs(self.data["timestamp"], self.data["tx"], self.data["rx"],
-                                                    self.data["latency"])
+            # In IperfTest._run_test
+            if self.graph:
+                self.graph.update_graphs(
+                    self.data.get("timestamp", []),
+                    self.data.get("local_tx", []),  # Use "local_tx"
+                    self.data.get("local_rx", []),  # Use "local_rx"
+                    self.data.get("latency", [])
+                )
 
             # --- Decision Logic ---
             # (Your existing extensive decision logic for UDP and TCP follows)
@@ -1070,12 +1076,22 @@ class IperfTest:
             add_line_to_summary("  Min ", min_lat_str);
             add_line_to_summary("  Max ", max_lat_str)
 
-        if self.verbose_logging and self.data['tx']:
+        local_tx_data = self.data.get('local_tx', [])  # Use .get() for safety
+        local_rx_data = self.data.get('local_rx', [])  # Use .get() for safety
+        throughput_data = self.data.get('throughput', [])  # Use .get() for safety
+
+        if self.verbose_logging and local_tx_data:  # Check if local_tx_data list is not empty
             add_line_to_summary("", "");
             add_line_to_summary("--- Last Measured Live Data (Verbose) ---")
-            add_line_to_summary("  Tx", f"{self.data['tx'][-1]:.2f} Mbps");
-            add_line_to_summary("  Rx", f"{self.data['rx'][-1]:.2f} Mbps")
-            add_line_to_summary("  Total Achieved", f"{self.data['throughput'][-1]:.2f} Mbps")
+            add_line_to_summary("  Local Tx", f"{local_tx_data[-1]:.2f} Mbps");  # Use local_tx_data
+            if local_rx_data:  # Check if local_rx_data is not empty
+                add_line_to_summary("  Local Rx", f"{local_rx_data[-1]:.2f} Mbps")  # Use local_rx_data
+            else:
+                add_line_to_summary("  Local Rx", "N/A")
+            if throughput_data:  # Check if throughput_data is not empty
+                add_line_to_summary("  Total Achieved", f"{throughput_data[-1]:.2f} Mbps")
+            else:
+                add_line_to_summary("  Total Achieved", "N/A")
         summary_lines.append(f"+{'-' * (box_width - 2)}+")
         for line in summary_lines: self._log(line)
 

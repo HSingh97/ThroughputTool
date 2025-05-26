@@ -245,14 +245,20 @@ class FloodPingTest:
                 pass # Explicitly do nothing here for these specific actions
             else:
                 # Latency is valid, so append data, update graph, and log the [+] status line
-                self.data["tx"].append(current_tx)
-                self.data["rx"].append(current_rx)
+                self.data["local_tx"].append(current_tx)
+                self.data["local_rx"].append(current_rx)
                 self.data["latency"].append(icmp_latency_this_cycle)
                 self.data["throughput"].append(total_throughput)
                 self.data["timestamp"].append(current_time)
 
+                # In FloodPingTest._run_test (and similarly in IperfTest._run_test)
                 if self.graph:
-                    self.graph.update_graphs(self.data["timestamp"], self.data["tx"], self.data["rx"], self.data["latency"])
+                    self.graph.update_graphs(
+                        self.data.get("timestamp", []),  # Use .get for safety
+                        self.data.get("local_tx", []),  # Use "local_tx"
+                        self.data.get("local_rx", []),  # Use "local_rx"
+                        self.data.get("latency", [])
+                    )
 
                 log_msg_status = (
                     f"[+] Instances: {self.current_instance_count:<3} | Tx: {current_tx:7.2f} Mbps | Rx: {current_rx:7.2f} Mbps | "
