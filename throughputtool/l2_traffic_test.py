@@ -415,8 +415,8 @@ class L2TrafficTest:
                                                  duration_secs=duration, total=local_tx_rate,  # Total based on local Tx
                                                  remote_rx_val=latest_remote_rx)
                 if self.graph:  # Pass only the data GraphManager expects
-                    self.graph.update_graphs(self.data["timestamp"], self.data["local_tx"],
-                                             self.data["local_rx"], self.data["latency"])
+                    self.graph.update_graphs(self.data["timestamp"], self.data["local_rx"],
+                                             self.data["remote_rx"], self.data["latency"])
 
                 self._log(f"[Target: {self.target_l2_rate:.2f} Mbps] "
                           f"Local Tx: {local_tx_rate:.2f} Mbps, Local Rx: {local_rx_rate:.2f} Mbps" +

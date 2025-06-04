@@ -203,9 +203,9 @@ def create_layout(app, interfaces):
             if protocol_sel == "UDP":
                 set_visibility("Speed Profile", new_row=row_idx_right, visible=True);
                 row_idx_right += 1
-                if ui_widgets["Direction (iperf3)_combo"].cget('values') != ("Uplink", "Downlink"):
-                    ui_widgets["Direction (iperf3)_combo"]['values'] = ("Uplink", "Downlink")
-                    if direction_var.get() == "Bi-Di": direction_var.set("Uplink")
+                if ui_widgets["Direction (iperf3)_combo"].cget('values') != ("Uplink", "Downlink", "Bi-Di"):
+                    ui_widgets["Direction (iperf3)_combo"]['values'] = ("Uplink", "Downlink", "Bi-Di")
+                    #if direction_var.get() == "Bi-Di": direction_var.set("Uplink")
             else:  # TCP
                 if ui_widgets["Direction (iperf3)_combo"].cget('values') != ("Uplink", "Downlink", "Bi-Di"):
                     ui_widgets["Direction (iperf3)_combo"]['values'] = ("Uplink", "Downlink", "Bi-Di")
