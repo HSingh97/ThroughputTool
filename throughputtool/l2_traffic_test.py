@@ -6,19 +6,22 @@ import time
 import psutil
 import importlib.resources
 import os
+import signal  # Added for signal constants
 import paramiko  # For SSH functionality
 import traceback
-import tkinter as tk  # Added for _log method
+import tkinter as tk
+import re  # For parsing ping output
+import statistics  # For mean
 
 # --- Constants ---
-REMOTE_SCRIPT_NAME = "remote_rx_agent.py"  # Ensure this file exists where the script can find it
-REMOTE_PYTHON_EXEC = "python3"  # Command to run python3 on the remote machine
+REMOTE_SCRIPT_NAME = "remote_rx_agent.py"
+REMOTE_PYTHON_EXEC = "python3"
 
 
 class L2TrafficTest:
     def __init__(self, iface, ui_refs, ethertype="All", remote_mac="", packet_size=1400,
-                 target_l2_rate=50.0,  # Added: Target L2 rate in Mbps
-                 profile="Moderate",  # Currently unused in L2 test but kept for consistency
+                 target_l2_rate=50.0,
+                 profile="Moderate",  # Currently unused in L2 test
                  data_store=None, graph=None, update_metrics=None,
                  remote_ip="", remote_user="", remote_pass="", remote_iface_name="",
                  measure_remote_rx=False, verbose=False):
@@ -28,16 +31,15 @@ class L2TrafficTest:
         self.ethertype_str = ethertype
         self.remote_mac = remote_mac.strip()
         self.packet_size = int(packet_size)
-        self.target_l2_rate = float(target_l2_rate)  # Store the target rate
+        self.target_l2_rate = float(target_l2_rate)
         self.profile = profile
         self.verbose = verbose
+        self.measure_remote_rx = measure_remote_rx
 
         self.data = data_store if data_store is not None else {}
-        self.data.setdefault("local_tx", self.data.pop("tx", []))
-        self.data.setdefault("local_rx", self.data.pop("rx", []))
-        for key_to_ensure in ["latency", "timestamp", "throughput"]:
+        for key_to_ensure in ["local_tx", "local_rx", "latency", "timestamp", "throughput"]:
             self.data.setdefault(key_to_ensure, [])
-        if measure_remote_rx:
+        if self.measure_remote_rx:
             self.data.setdefault("remote_rx", [])
 
         self.graph = graph
@@ -54,7 +56,6 @@ class L2TrafficTest:
         self.remote_user = remote_user
         self.remote_pass = remote_pass
         self.remote_iface_name = remote_iface_name
-        self.measure_remote_rx = measure_remote_rx
         self.ssh_client = None
         self.ssh_channel = None
         self.ssh_stdout_thread = None
@@ -64,6 +65,21 @@ class L2TrafficTest:
         self.stop_flag = False
         self.process = None
         self.thread = None
+
+        self.latency_thread = None
+        self.latency_stop_flag = False
+        self.latency_config = {
+            "ping_interval_s": 1,
+            "ping_packet_timeout_s": 4,  # Increased from 1 to 4 seconds
+            "ping_count": 1,
+            "ping_process_timeout_margin_s": 2,  # Subprocess timeout will be (4*1)+2 = 6s
+            "ping_timeout_placeholder_ms": 9999.0
+        }
+        self.ping_rtt_pattern = re.compile(r"time=([\d.]+)\s*ms", re.IGNORECASE)
+        self.ping_avg_rtt_pattern = re.compile(r"(?:min/avg/max|rtt min/avg/max)(?:/[^=]+)?\s*=\s*[\d.]+/([\d.]+)/",
+                                               re.IGNORECASE)
+
+        self.initial_skip_seconds = 3
 
     def _log(self, msg, is_verbose=False):
         if not is_verbose or self.verbose:
@@ -85,8 +101,12 @@ class L2TrafficTest:
     def run(self):
         self._log("[*] L2/L3 Traffic Test thread starting...")
         self.stop_flag = False
-        for key in ["local_tx", "local_rx", "latency", "timestamp", "throughput", "remote_rx"]:
+        self.latency_stop_flag = False
+
+        for key in ["local_tx", "local_rx", "latency", "timestamp", "throughput"]:
             self.data.setdefault(key, []).clear()
+        if self.measure_remote_rx:
+            self.data.setdefault("remote_rx", []).clear()
 
         if self.thread and self.thread.is_alive():
             self._log("[Warning] Test thread is already running.", is_verbose=True);
@@ -101,7 +121,79 @@ class L2TrafficTest:
     def stop(self):
         self._log("[*] Stop command received. Attempting to stop L2/L3 Traffic Test...")
         self.stop_flag = True
+        self.latency_stop_flag = True
         if self.ui and self.ui.get('status_bar'): self.ui['status_bar'].config(text="Test Stopping...")
+
+    def _start_latency_monitor(self):
+        if not self.remote_ip:
+            self._log("[Info] No remote IP specified, skipping latency monitoring.", is_verbose=True)
+            return False
+
+        if self.latency_thread and self.latency_thread.is_alive():
+            self._log("[Warning] Latency monitor thread already running.", is_verbose=True)
+            return True
+
+        self.latency_stop_flag = False
+        self.latency_thread = threading.Thread(target=self._monitor_latency, daemon=True)
+        self.latency_thread.start()
+        self._log("[*] Latency monitoring thread started.", is_verbose=True)
+        return True
+
+    def _monitor_latency(self):
+        self._log("[Info] Latency monitor loop started.", is_verbose=True)
+        while not self.latency_stop_flag and not self.stop_flag:
+            latency_value = self.latency_config["ping_timeout_placeholder_ms"]
+            try:
+                cmd = ["ping",
+                       "-c", str(self.latency_config["ping_count"]),
+                       "-W", str(self.latency_config["ping_packet_timeout_s"]),  # -W uses seconds
+                       self.remote_ip]
+
+                process_timeout = (self.latency_config["ping_packet_timeout_s"] * self.latency_config["ping_count"]) + \
+                                  self.latency_config["ping_process_timeout_margin_s"]
+
+                if self.verbose: self._log(f"[LatencyMon] Executing: {' '.join(cmd)}", is_verbose=True)
+
+                ping_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, timeout=process_timeout, check=False)
+                output = ping_proc.stdout
+                if self.verbose: self._log(f"[LatencyMon] Ping output:\n{output}", is_verbose=True)
+
+                avg_match = self.ping_avg_rtt_pattern.search(output)
+                if avg_match:
+                    latency_value = float(avg_match.group(1))
+                else:
+                    matches = self.ping_rtt_pattern.findall(output)
+                    if matches:
+                        latency_value = float(matches[-1])
+                    elif "0% packet loss" not in output and \
+                            ("100% packet loss" in output or ping_proc.returncode != 0):
+                        if self.verbose: self._log("[LatencyMon] Ping timeout or 100% loss.", is_verbose=True)
+                    elif "0% packet loss" in output and not matches and not avg_match:
+                        if self.verbose: self._log(
+                            "[LatencyMon] Ping OK but no RTT parsed. Assuming near-zero or check ping output format.",
+                            is_verbose=True)
+                        latency_value = 0.01
+
+                if self.verbose: self._log(f"[LatencyMon] Parsed latency: {latency_value} ms", is_verbose=True)
+
+            except subprocess.TimeoutExpired:
+                if self.verbose: self._log("[LatencyMon] Ping command timed out.", is_verbose=True)
+            except FileNotFoundError:
+                self._log("[ERROR] Ping command not found. Latency monitoring stopping.", is_verbose=False)
+                self.latency_stop_flag = True
+                latency_value = self.latency_config["ping_timeout_placeholder_ms"]
+            except Exception as e:
+                if self.verbose: self._log(f"[LatencyMon] Error: {e}", is_verbose=True)
+
+            self.data.setdefault("latency", []).append(latency_value)
+
+            if self.latency_config["ping_interval_s"] > 0 and \
+                    not self.latency_stop_flag and \
+                    not self.stop_flag:
+                time.sleep(self.latency_config["ping_interval_s"])
+
+        self._log("[Info] Latency monitor loop finished.", is_verbose=True)
 
     def _connect_ssh(self):
         if not self.measure_remote_rx: return True
@@ -165,7 +257,8 @@ class L2TrafficTest:
                 if os.path.exists(local_script_path):
                     script_found_method = "current working directory (__file__ missing)"
                 else:
-                    self._log(f"[ERROR] '{REMOTE_SCRIPT_NAME}' not found in CWD (__file__ undefined)."); return False
+                    self._log(f"[ERROR] '{REMOTE_SCRIPT_NAME}' not found in CWD (__file__ undefined).");
+                    return False
 
         self._log(
             f"[*] Using local path for remote agent script (found via {script_found_method}): {local_script_path}",
@@ -225,11 +318,11 @@ class L2TrafficTest:
                             self._log(
                                 f"[DEBUG_PARSE] Parsed DATA: {remote_rx_mbps:.2f} Mbps. Appending to self.data['remote_rx'].",
                                 is_verbose=True)
-
-                        self.data.setdefault("remote_rx", []).append(remote_rx_mbps)
+                        if self.measure_remote_rx:
+                            self.data.setdefault("remote_rx", []).append(remote_rx_mbps)
 
                         if self.ui and self.ui.get('metrics_labels') and self.ui['metrics_labels'].get('remote_rx'):
-                            try:  # Direct UI update (ensure thread-safe if needed, e.g. app.after for Tkinter)
+                            try:
                                 self.ui['metrics_labels']['remote_rx'].config(
                                     text=f"Remote Rx: {remote_rx_mbps:.2f} Mbps")
                             except Exception as e_ui_update:
@@ -275,7 +368,7 @@ class L2TrafficTest:
                 self._log(f"[*] Fallback: Attempting to send SIGINT to remote PID {self.remote_rx_pid}.",
                           is_verbose=True)
                 try:
-                    cmd_kill = f"kill -2 {self.remote_rx_pid}"  # SIGINT
+                    cmd_kill = f"kill -2 {self.remote_rx_pid}"
                     stdin, stdout, stderr = self.ssh_client.exec_command(cmd_kill, timeout=5)
                     if self.verbose:
                         kill_stdout = stdout.read().decode(errors='ignore').strip()
@@ -304,7 +397,7 @@ class L2TrafficTest:
 
     def _log_subprocess_output(self, pipe, pipe_name_prefix):
         try:
-            for line in iter(pipe.readline, ''):  # Read until pipe closes
+            for line in iter(pipe.readline, ''):
                 if line: self._log(f"[{pipe_name_prefix}] {line.strip()}", is_verbose=self.verbose)
         except ValueError:
             self._log(f"[{pipe_name_prefix}] Pipe closed or error during read.", is_verbose=True)
@@ -315,51 +408,57 @@ class L2TrafficTest:
 
     def _run_test(self):
         self._log("\n=== L2/L3 Traffic Test Started ===")
-        start_time = time.time()
+        test_run_start_time = time.time()
 
         active_threads = []
         local_flooder_stdout_thread = None
         local_flooder_stderr_thread = None
+        latency_monitor_started_successfully = False
 
         try:
             if self.measure_remote_rx:
                 if not self.remote_ip or not self.remote_user or not self.remote_iface_name:
                     self._log(
-                        "[ERROR] Remote IP, User, or Interface not specified for remote Rx measurement. Skipping.")
-                    self.measure_remote_rx = False  # Disable it for this run
+                        "[ERROR] Remote IP, User, or Interface not specified for remote Rx measurement. Skipping remote agent.")
                 elif not self._connect_ssh():
-                    raise Exception("SSH Connection Failed")
+                    raise Exception("SSH Connection Failed for Remote Agent")
                 elif not self._deploy_and_run_remote_agent(interval=1.0):
                     raise Exception("Remote Agent Deployment/Execution Failed")
-
                 if self.ssh_stdout_thread: active_threads.append(self.ssh_stdout_thread)
                 if self.ssh_stderr_thread: active_threads.append(self.ssh_stderr_thread)
 
+            if self.remote_ip:
+                if self._start_latency_monitor():
+                    latency_monitor_started_successfully = True
+                    if self.latency_thread: active_threads.append(self.latency_thread)
+            else:
+                self._log("[Info] No remote_ip provided, latency will not be monitored.", is_verbose=True)
+
             dst_mac = self.remote_mac if self.remote_mac else "ff:ff:ff:ff:ff:ff"
             try:
-                # Try to resolve path using package resources first
-                pkg_name = __package__ if __package__ else 'throughputtool'  # Guess package name
+                pkg_name = __package__ if __package__ else 'throughputtool'
                 with importlib.resources.path(pkg_name, 'l2_flooder') as flooder_path_obj:
                     flooder_path_str = str(flooder_path_obj)
             except (ModuleNotFoundError, FileNotFoundError, TypeError, Exception) as e_l2f_path:
                 self._log(
                     f"[Warning] Could not locate 'l2_flooder' via package resources ({e_l2f_path}). Trying CWD/PATH.",
                     is_verbose=True)
-                # Fallback: Check current working directory
                 flooder_path_cwd = os.path.join(os.getcwd(), "l2_flooder")
                 if os.path.exists(flooder_path_cwd) and os.access(flooder_path_cwd, os.X_OK):
                     flooder_path_str = flooder_path_cwd
                 else:
-                    flooder_path_str = "l2_flooder"  # Final fallback: assume it's in PATH
+                    flooder_path_str = "l2_flooder"
 
             self._log(f"[*] Using l2_flooder path: {flooder_path_str}", is_verbose=True)
-            # Pass self.target_l2_rate to l2_flooder
             cmd = ["sudo", flooder_path_str, self.iface, str(self.packet_size),
                    self.ethertype_code, dst_mac, str(self.target_l2_rate)]
             self._log(f"[*] Full command to execute: {' '.join(cmd)}", is_verbose=True)
 
-            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-            self._log(f"[*] Local l2_flooder process started with PID: {self.process.pid}", is_verbose=True)
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            text=True, bufsize=1, preexec_fn=os.setsid)
+            self._log(
+                f"[*] Local l2_flooder process started with PID: {self.process.pid} (PGID: {os.getpgid(self.process.pid) if hasattr(os, 'getpgid') else 'N/A'})",
+                is_verbose=True)
 
             local_flooder_stdout_thread = threading.Thread(target=self._log_subprocess_output,
                                                            args=(self.process.stdout, "L2_FLOODER_STDOUT"), daemon=True)
@@ -370,10 +469,12 @@ class L2TrafficTest:
             local_flooder_stderr_thread.start();
             active_threads.append(local_flooder_stderr_thread)
 
-            time.sleep(0.3)  # Increased slightly
+            time.sleep(0.3)
             if self.process.poll() is not None:
                 raise Exception(
                     f"Local l2_flooder failed to start or exited immediately. RC: {self.process.returncode}")
+
+            end_of_skip_period_ts = test_run_start_time + self.initial_skip_seconds
 
             while not self.stop_flag:
                 stats1 = psutil.net_io_counters(pernic=True).get(self.iface)
@@ -381,7 +482,7 @@ class L2TrafficTest:
                 if not stats1: self._log(f"[Error] Interface {self.iface} stats not found (stats1)."); break
 
                 if self.stop_flag: break
-                time.sleep(1.0)  # Main measurement interval
+                time.sleep(1.0)
                 if self.stop_flag: break
 
                 stats2 = psutil.net_io_counters(pernic=True).get(self.iface)
@@ -389,108 +490,319 @@ class L2TrafficTest:
                 if not stats2: self._log(f"[Error] Interface {self.iface} stats not found (stats2)."); break
 
                 time_diff = t2 - t1
-                if time_diff <= 0: time_diff = 1.0  # Avoid div by zero, use nominal interval
+                if time_diff <= 0: time_diff = 1.0
 
                 local_tx_rate = ((stats2.bytes_sent - stats1.bytes_sent) * 8) / time_diff / 1_000_000
                 local_rx_rate = ((stats2.bytes_recv - stats1.bytes_recv) * 8) / time_diff / 1_000_000
 
-                current_ts_for_data = time.time()
-                duration = int(current_ts_for_data - start_time)
+                current_data_collection_ts = time.time()
 
                 self.data["local_tx"].append(local_tx_rate)
                 self.data["local_rx"].append(local_rx_rate)
-                self.data["latency"].append(0.0)  # L2 test doesn't measure latency directly yet
-                self.data["timestamp"].append(current_ts_for_data)
-                self.data["throughput"].append(local_tx_rate)  # Primary throughput often considered as Tx
+                self.data["timestamp"].append(current_data_collection_ts)
 
-                latest_remote_rx = 0.0
-                if self.measure_remote_rx and self.data.get("remote_rx"):  # Use .get for safety
-                    try:
-                        latest_remote_rx = self.data["remote_rx"][-1]
-                    except IndexError:
-                        pass  # Keep 0.0 if list is empty
+                actual_throughput_for_log = 0.0
+                log_source_label = "(N/A)"
+                latest_remote_rx_val_for_metrics = 0.0
 
+                remote_rx_data_list = self.data.get("remote_rx", [])
+                if self.measure_remote_rx and remote_rx_data_list:
+                    actual_throughput_for_log = remote_rx_data_list[-1]
+                    log_source_label = "(Remote Rx)"
+                    latest_remote_rx_val_for_metrics = actual_throughput_for_log
+                elif self.data["local_tx"]:
+                    actual_throughput_for_log = self.data["local_tx"][-1]
+                    log_source_label = "(Local Tx)"
+
+                latest_latency_val_for_metrics = self.data["latency"][-1] if self.data.get("latency") else \
+                self.latency_config["ping_timeout_placeholder_ms"]
+
+                self._log(
+                    f"Target: {self.target_l2_rate:.2f} Mbps, Actual Throughput: {actual_throughput_for_log:.2f} Mbps {log_source_label}, Latency: {latest_latency_val_for_metrics if latest_latency_val_for_metrics != self.latency_config['ping_timeout_placeholder_ms'] else 'N/A'} ms")
+
+                duration_for_metrics = current_data_collection_ts - test_run_start_time
                 if self.update_metrics_callback:
-                    self.update_metrics_callback(tx=local_tx_rate, rx=local_rx_rate, latency=0.0, loss=0.0,
-                                                 duration_secs=duration, total=local_tx_rate,  # Total based on local Tx
-                                                 remote_rx_val=latest_remote_rx)
-                if self.graph:  # Pass only the data GraphManager expects
-                    self.graph.update_graphs(self.data["timestamp"], self.data["local_rx"],
-                                             self.data["remote_rx"], self.data["latency"])
+                    self.update_metrics_callback(tx=local_tx_rate, rx=local_rx_rate,
+                                                 latency=latest_latency_val_for_metrics,
+                                                 loss=0.0,
+                                                 duration_secs=int(duration_for_metrics),
+                                                 total=actual_throughput_for_log,
+                                                 remote_rx_val=latest_remote_rx_val_for_metrics)
 
-                self._log(f"[Target: {self.target_l2_rate:.2f} Mbps] "
-                          f"Local Tx: {local_tx_rate:.2f} Mbps, Local Rx: {local_rx_rate:.2f} Mbps" +
-                          (f", Remote Rx: {latest_remote_rx:.2f} Mbps" if self.measure_remote_rx else ""))
+                if self.graph and current_data_collection_ts >= end_of_skip_period_ts:
+                    ts_all_for_graph = self.data.get("timestamp", [])
+                    plot_start_index = 0
+                    for i, ts_val in enumerate(ts_all_for_graph):
+                        if ts_val >= end_of_skip_period_ts:
+                            plot_start_index = i
+                            break
+                    else:
+                        plot_start_index = len(ts_all_for_graph)
+
+                    if plot_start_index < len(ts_all_for_graph):
+                        ts_p = ts_all_for_graph[plot_start_index:]
+                        effective_plot_len = len(ts_p)
+
+                        lrx_all_for_graph = self.data.get("local_rx", [])
+                        lrx_p = lrx_all_for_graph[max(0, len(lrx_all_for_graph) - effective_plot_len):]
+
+                        lat_all_source_for_graph = self.data.get("latency", [])
+                        if latency_monitor_started_successfully:
+                            lat_slice = lat_all_source_for_graph[
+                                        max(0, len(lat_all_source_for_graph) - effective_plot_len):]
+                            lat_p = [val if val != self.latency_config["ping_timeout_placeholder_ms"] else 0 for val in
+                                     lat_slice]
+                        else:
+                            lat_p = [0.0] * effective_plot_len
+
+                        rrx_all_source_for_graph = self.data.get("remote_rx", []) if self.measure_remote_rx else []
+                        if self.measure_remote_rx:
+                            rrx_slice = rrx_all_source_for_graph[
+                                        max(0, len(rrx_all_source_for_graph) - effective_plot_len):]
+                            rrx_p = rrx_slice
+                        else:
+                            rrx_p = [0.0] * effective_plot_len
+
+                        final_len = min(len(ts_p), len(lrx_p), len(lat_p), len(rrx_p))
+                        if final_len > 0 and final_len == len(ts_p):
+                            self.graph.update_graphs(
+                                ts_p[:final_len],
+                                lrx_p[-final_len:],
+                                rrx_p[-final_len:],
+                                lat_p[-final_len:]
+                            )
+                        elif self.verbose and final_len != len(ts_p):
+                            self._log(
+                                f"[Graph] Length mismatch for plotting: ts={len(ts_p)}, lrx={len(lrx_p)}, rrx={len(rrx_p)}, lat={len(lat_p)}. Plotting common len {final_len}.",
+                                is_verbose=True)
+                            if final_len > 0:
+                                self.graph.update_graphs(
+                                    ts_p[:final_len],
+                                    lrx_p[-final_len:],
+                                    rrx_p[-final_len:],
+                                    lat_p[-final_len:]
+                                )
+                elif self.graph and self.verbose:
+                    self._log(
+                        f"Graphing deferred: Still in initial skip period. Current: {current_data_collection_ts:.1f}, Skip End: {end_of_skip_period_ts:.1f}",
+                        is_verbose=True)
 
         except Exception as e:
             self._log(f"[ERROR] Test execution failed: {e}")
-            self._log(traceback.format_exc(), is_verbose=True)  # Log full traceback if verbose
+            self._log(traceback.format_exc(), is_verbose=True)
         finally:
             self._log("[*] Test loop finished or interrupted. Starting cleanup...", is_verbose=True)
+            self.latency_stop_flag = True
 
             if self.process and self.process.poll() is None:
-                self._log(f"[*] Terminating local l2_flooder process (PID {self.process.pid})...", is_verbose=True)
+                pgid_to_terminate = 0
                 try:
-                    self.process.terminate()  # SIGTERM
-                    self.process.wait(timeout=5)  # Increased timeout for l2_flooder exit
+                    pgid_to_terminate = os.getpgid(self.process.pid) if hasattr(os, 'getpgid') else self.process.pid
+                    self._log(
+                        f"[*] Terminating local l2_flooder process group (PGID {pgid_to_terminate}) with SIGTERM...",
+                        is_verbose=True)
+                    os.killpg(pgid_to_terminate, signal.SIGTERM)
+                    self.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._log(
-                        f"[Warning] Local l2_flooder (PID {self.process.pid}) unresponsive to SIGTERM. Sending SIGKILL...",
+                        f"[Warning] Local l2_flooder PGID {pgid_to_terminate} unresponsive to SIGTERM. Sending SIGKILL...",
                         is_verbose=True)
-                    self.process.kill()  # SIGKILL
                     try:
+                        os.killpg(pgid_to_terminate, signal.SIGKILL)
                         self.process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
-                        self._log(f"[Warning] Local l2_flooder (PID {self.process.pid}) did not exit after SIGKILL.",
+                        self._log(f"[Warning] Local l2_flooder PGID {pgid_to_terminate} did not exit after SIGKILL.",
                                   is_verbose=True)
-                except Exception as e_kill:
-                    self._log(f"[Error] Failed to stop local l2_flooder: {e_kill}", is_verbose=True)
-
-                if self.process and self.process.poll() is None:  # Still running?
+                    except (ProcessLookupError, PermissionError) as e_kill_pg:
+                        self._log(f"[Warning] os.killpg SIGKILL for PGID {pgid_to_terminate} failed: {e_kill_pg}",
+                                  is_verbose=True)
+                    except Exception as e_kill_generic:
+                        self._log(
+                            f"[Error] Exception during os.killpg SIGKILL for PGID {pgid_to_terminate}: {e_kill_generic}",
+                            is_verbose=True)
+                except (ProcessLookupError, PermissionError) as e_term_pg:
                     self._log(
-                        f"[Warning] l2_flooder (PID {self.process.pid}) still running. Attempting 'sudo killall l2_flooder'.",
+                        f"[Warning] os.killpg SIGTERM for PGID {pgid_to_terminate} failed: {e_term_pg}. Process might have already exited.",
+                        is_verbose=True)
+                except Exception as e_term_generic:
+                    self._log(f"[Error] Exception during SIGTERM for PGID {pgid_to_terminate}: {e_term_generic}",
+                              is_verbose=True)
+
+                if self.process and self.process.poll() is None:
+                    self._log(
+                        f"[Warning] l2_flooder (PID {self.process.pid}) still running after PGID signals. Attempting direct terminate/kill and then 'sudo killall'.",
                         is_verbose=True)
                     try:
-                        killall_cmd = ["sudo", "killall", "l2_flooder"]
-                        self._log(f"[*] Executing: {' '.join(killall_cmd)}", is_verbose=True)
+                        self.process.terminate()
+                        self.process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=1)
+                    except Exception:
+                        pass
+
+                    try:
+                        killall_cmd = ["sudo", "killall", "-9", "l2_flooder"]
+                        self._log(f"[*] Executing fallback: {' '.join(killall_cmd)}", is_verbose=True)
                         subprocess.run(killall_cmd, timeout=2, check=False, capture_output=True, text=True)
                     except Exception as e_killall:
-                        self._log(f"[Error] 'sudo killall l2_flooder' failed: {e_killall}", is_verbose=True)
+                        self._log(f"[Error] Fallback 'sudo killall l2_flooder' failed: {e_killall}", is_verbose=True)
             self.process = None
 
-            # Join all started threads
-            for th_name in ['local_flooder_stdout_thread', 'local_flooder_stderr_thread',
-                            'ssh_stdout_thread', 'ssh_stderr_thread']:
-                th = getattr(self, th_name, None)
+            for th in active_threads:
                 if th and th.is_alive():
-                    if self.verbose: self._log(f"[*] Joining thread: {th.name}", is_verbose=True)
+                    if self.verbose: self._log(f"[*] Joining thread: {th.name} (Timeout: 1.0s)", is_verbose=True)
                     try:
-                        th.join(timeout=0.5)
+                        th.join(timeout=1.0)
+                        if th.is_alive() and self.verbose: self._log(f"[Warning] Thread {th.name} did not join.",
+                                                                     is_verbose=True)
                     except Exception as e_join:
                         self._log(f"[Warning] Error joining thread {th.name}: {e_join}", is_verbose=True)
 
+            if self.latency_thread and self.latency_thread.is_alive() and self.latency_thread not in active_threads:
+                if self.verbose: self._log(f"[*] Joining latency thread explicitly... (Timeout: 1.0s)", is_verbose=True)
+                self.latency_thread.join(timeout=1.0)
+                if self.latency_thread.is_alive() and self.verbose: self._log(
+                    f"[Warning] Latency thread did not join after explicit attempt.", is_verbose=True)
+
             if self.measure_remote_rx and self.ssh_client:
-                self._stop_remote_agent()  # Ensures its threads are joined if still alive
+                self._stop_remote_agent()
                 self._disconnect_ssh()
 
-            self._final_summary(start_time)
+            self._final_summary(test_run_start_time)
 
-    def _final_summary(self, start_time):
-        duration = int(time.time() - start_time)
+    def _final_summary(self, test_run_start_time):
+        duration = int(time.time() - test_run_start_time)
         mins, secs = divmod(duration, 60)
 
-        final_local_tx = self.data.get('local_tx', [])[-1] if self.data.get('local_tx') else 0.0
-        final_local_rx = self.data.get('local_rx', [])[-1] if self.data.get('local_rx') else 0.0
-        final_remote_rx = 0.0
-        if self.measure_remote_rx:
-            final_remote_rx = self.data.get('remote_rx', [])[-1] if self.data.get('remote_rx') else 0.0
+        # Get all collected data
+        all_timestamps = self.data.get("timestamp", [])
+        all_local_tx = self.data.get("local_tx", [])
+        all_remote_rx = self.data.get("remote_rx", [])
+        all_latency = self.data.get("latency", [])
 
-        self._log("\n--- L2/L3 Traffic Test Stopped ---")
-        self._log(f"Test Duration        : {mins:02}:{secs:02} (mm:ss)")
-        self._log(f"Final Live Local Tx  : {final_local_tx:.2f} Mbps")
-        self._log(f"Final Live Local Rx  : {final_local_rx:.2f} Mbps")
+        # Determine the actual number of points to skip based on initial_skip_seconds
+        # This assumes that each data point in the lists corresponds to roughly one second of measurement.
+        # For more precise timestamp-based skipping, a different approach would be needed if data collection
+        # intervals are highly variable or not synchronized.
+        skip_n_points = self.initial_skip_seconds
+
+        # Slice data lists for summary, ensuring we don't try to slice beyond list length
+        local_tx_for_summary = all_local_tx[skip_n_points:] if len(all_local_tx) > skip_n_points else []
+        remote_rx_for_summary = []
         if self.measure_remote_rx:
-            self._log(f"Final Live Remote Rx : {final_remote_rx:.2f} Mbps")
+            remote_rx_for_summary = all_remote_rx[skip_n_points:] if len(all_remote_rx) > skip_n_points else []
+
+        latency_for_summary_stats = []
+        if self.remote_ip:
+            latency_for_summary_stats = all_latency[skip_n_points:] if len(all_latency) > skip_n_points else []
+
+        valid_latency_for_summary_stats_numeric = [l for l in latency_for_summary_stats if
+                                                   l != self.latency_config["ping_timeout_placeholder_ms"]]
+
+        primary_throughput_series_for_stats = []
+        throughput_source_for_stats = "(N/A)"
+
+        if self.measure_remote_rx and remote_rx_for_summary:
+            primary_throughput_series_for_stats = remote_rx_for_summary
+            throughput_source_for_stats = "(Remote Rx)"
+        elif local_tx_for_summary:
+            primary_throughput_series_for_stats = local_tx_for_summary
+            throughput_source_for_stats = "(Local Tx)"
+
+        min_tp_str, avg_tp_str, max_tp_str = "N/A", "N/A", "N/A"
+
+        # Filter out non-positive values for Min/Avg/Max throughput calculation from the valid window
+        meaningful_tp_stats = [x for x in primary_throughput_series_for_stats if
+                               isinstance(x, (int, float)) and x > 0.01]
+
+        if meaningful_tp_stats:
+            min_tp_str = f"{min(meaningful_tp_stats):.2f} Mbps"
+            avg_tp_str = f"{statistics.mean(meaningful_tp_stats):.2f} Mbps"
+            max_tp_str = f"{max(meaningful_tp_stats):.2f} Mbps"
+        elif primary_throughput_series_for_stats:  # If list had only 0s or non-numerics after skip
+            # Check if there were any numerics at all in the valid window, even if they were 0 or <=0.01
+            all_numeric_in_valid_series = [x for x in primary_throughput_series_for_stats if
+                                           isinstance(x, (int, float))]
+            if all_numeric_in_valid_series:
+                min_tp_str = f"{min(all_numeric_in_valid_series):.2f} Mbps"
+                avg_tp_str = f"{statistics.mean(all_numeric_in_valid_series):.2f} Mbps"
+                max_tp_str = f"{max(all_numeric_in_valid_series):.2f} Mbps"
+
+        details = [
+            ("Test Duration", f"{mins:02}:{secs:02} (mm:ss)"),
+            ("Target L2 Rate", f"{self.target_l2_rate:.2f} Mbps"),
+            ("Packet Size", f"{self.packet_size} bytes"),
+            ("EtherType", f"{self.ethertype_str} ({self.ethertype_code})"),
+            ("Destination MAC", self.remote_mac if self.remote_mac else "Broadcast/ff:ff:ff:ff:ff:ff"),
+        ]
+        if self.remote_ip:
+            details.append(("Remote Target (Ping/Agent)", self.remote_ip))
+        details.append(("Initial Skip Period", f"{self.initial_skip_seconds} seconds (for summary stats)"))
+
+        details.append(("", ""))
+        details.append(("--- Actual Throughput Statistics ---", None))
+        details.append((f"  Min Throughput {throughput_source_for_stats}", min_tp_str))
+        details.append((f"  Avg Throughput {throughput_source_for_stats}", avg_tp_str))
+        details.append((f"  Max Throughput {throughput_source_for_stats}", max_tp_str))
+
+        if self.remote_ip:
+            avg_lat_str, min_lat_str, max_lat_str = "N/A", "N/A", "N/A"
+
+            timeout_count_for_stats = latency_for_summary_stats.count(
+                self.latency_config["ping_timeout_placeholder_ms"])
+
+            if valid_latency_for_summary_stats_numeric:
+                avg_lat = statistics.mean(valid_latency_for_summary_stats_numeric)
+                min_lat = min(valid_latency_for_summary_stats_numeric)
+                max_lat = max(valid_latency_for_summary_stats_numeric)
+                avg_lat_str = f"{avg_lat:.2f} ms"
+                min_lat_str = f"{min_lat:.2f} ms"
+                max_lat_str = f"{max_lat:.2f} ms"
+
+            if timeout_count_for_stats > 0:
+                timeout_info = f" ({timeout_count_for_stats} timeouts)"
+                if not valid_latency_for_summary_stats_numeric:
+                    avg_lat_str = f"N/A{timeout_info}"
+                    min_lat_str = f"N/A{timeout_info}"
+                    max_lat_str = f"> {self.latency_config['ping_packet_timeout_s']:.0f}s{timeout_info}"
+                else:
+                    max_lat_str += timeout_info
+
+            details.extend([
+                ("", ""),
+                ("--- Latency Statistics (Ping to Remote IP) ---", None),
+                ("  Average RTT", avg_lat_str),
+                ("  Min RTT", min_lat_str),
+                ("  Max RTT", max_lat_str),
+            ])
+        elif self.remote_ip:
+            details.extend([
+                ("", ""),
+                ("--- Latency Statistics (Ping to Remote IP) ---", None),
+                ("  Average RTT", "N/A (No valid data after skip)"),
+            ])
+
+        self._log("\n" + "+" + "-" * 70 + "+")
+        self._log(f"| {'L2 Traffic Test Summary'.center(70)} |")
+        self._log("+" + "-" * 70 + "+")
+
+        max_key_len = 0
+        for key, _ in details:
+            if key and "---" not in key:
+                max_key_len = max(max_key_len, len(key))
+
+        for key, value in details:
+            if "---" in key and value is None:
+                self._log(f"| {key.center(70)} |")
+            elif not key and not value:
+                self._log(f"| {' '.ljust(70)} |")
+            else:
+                padded_key = (key if key is not None else "").ljust(max_key_len)
+                str_value = str(value) if value is not None else ""
+                line_content = f"  {padded_key} : {str_value}"
+                self._log(f"| {line_content.ljust(70)} |")
+        self._log("+" + "-" * 70 + "+")
 
         if self.ui:
             for key in ['start_button', 'stop_button', 'status_bar',
@@ -504,7 +816,8 @@ class L2TrafficTest:
                             widget.config(state="disabled")
                         elif key == 'status_bar':
                             widget.config(text="Test Stopped")
-                        else:
+                        elif key in ['export_log_btn', 'save_tp_graph_btn', 'save_latency_graph_btn']:
                             widget.config(state="normal")
                     except Exception as e_ui:
                         self._log(f"[UI Error] Configuring '{key}': {e_ui}", is_verbose=True)
+
