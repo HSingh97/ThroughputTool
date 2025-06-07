@@ -52,6 +52,9 @@ class L2TrafficTest:
         }
         self.ethertype_code = ethertype_map.get(self.ethertype_str, "0x0800")
 
+        # New variable to hold final stats from the C program
+        self.l2_flooder_packets_sent = None
+
         self.remote_ip = remote_ip
         self.remote_user = remote_user
         self.remote_pass = remote_pass
@@ -395,7 +398,46 @@ class L2TrafficTest:
             self.ssh_client = None
             self._log("[+] SSH Disconnected.", is_verbose=True)
 
+    # --- MODIFICATION START: New method to parse l2_flooder output ---
+    def _parse_l2_flooder_output(self, pipe):
+        """
+        Parses output from the l2_flooder C program.
+        In verbose mode, it prints everything.
+        In non-verbose mode, it hides all output except for a final summary message
+        which it constructs from a special output line from the C program.
+        """
+        try:
+            for line in iter(pipe.readline, ''):
+                line = line.strip()
+                if not line:
+                    continue
+
+                # In verbose mode, log everything from the flooder's stdout for debugging.
+                if self.verbose:
+                    self._log(f"[L2_FLOODER_STDOUT] {line}", is_verbose=True)
+                    continue
+
+                # In non-verbose mode, only look for the final statistics line.
+                if line.startswith("FINAL_STATS:PacketsSent="):
+                    try:
+                        count_str = line.split('=')[1]
+                        self.l2_flooder_packets_sent = int(count_str)
+                        # Log a clean, user-friendly message.
+                        self._log(
+                            f"[Info] Traffic generator stopped. Total packets sent: {self.l2_flooder_packets_sent:,}")
+                    except (IndexError, ValueError):
+                        # Log an error if parsing fails, but only in verbose mode.
+                        self._log(f"[Warning] Could not parse final packet count: {line}", is_verbose=True)
+
+        except Exception as e:
+            self._log(f"[Error] Exception in l2_flooder output parser: {e}", is_verbose=True)
+        finally:
+            if pipe: pipe.close()
+
+    # --- MODIFICATION END ---
+
     def _log_subprocess_output(self, pipe, pipe_name_prefix):
+        """Generic handler for stderr or other verbose-only streams."""
         try:
             for line in iter(pipe.readline, ''):
                 if line: self._log(f"[{pipe_name_prefix}] {line.strip()}", is_verbose=self.verbose)
@@ -407,6 +449,9 @@ class L2TrafficTest:
             if pipe: pipe.close()
 
     def _run_test(self):
+        # --- MODIFICATION: Reset packet count at the start of each test ---
+        self.l2_flooder_packets_sent = None
+
         self._log("\n=== L2/L3 Traffic Test Started ===")
         test_run_start_time = time.time()
 
@@ -450,8 +495,26 @@ class L2TrafficTest:
                     flooder_path_str = "l2_flooder"
 
             self._log(f"[*] Using l2_flooder path: {flooder_path_str}", is_verbose=True)
+
+            vlan_id_arg = "0"
+            ethertype_for_flooder = self.ethertype_code
+
+            if self.ethertype_str == "VLAN":
+                vlan_id_arg = "auto"
+                ethertype_for_flooder = "0x0800"
+                if not self.verbose:
+                    self._log("[Info] Generating VLAN-tagged traffic with cycling IDs (inner protocol: IPv4).")
+                else:
+                    self._log(
+                        "[Info] 'VLAN' selected. Generating VLAN-tagged frames with cycling IDs (1-4094) and inner protocol IPv4 (0x0800).")
+
+            # --- MODIFICATION START: Add 'quiet' argument if not in verbose mode ---
             cmd = ["sudo", flooder_path_str, self.iface, str(self.packet_size),
-                   self.ethertype_code, dst_mac, str(self.target_l2_rate)]
+                   ethertype_for_flooder, dst_mac, str(self.target_l2_rate), vlan_id_arg]
+            if not self.verbose:
+                cmd.append("quiet")
+            # --- MODIFICATION END ---
+
             self._log(f"[*] Full command to execute: {' '.join(cmd)}", is_verbose=True)
 
             self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -460,10 +523,14 @@ class L2TrafficTest:
                 f"[*] Local l2_flooder process started with PID: {self.process.pid} (PGID: {os.getpgid(self.process.pid) if hasattr(os, 'getpgid') else 'N/A'})",
                 is_verbose=True)
 
-            local_flooder_stdout_thread = threading.Thread(target=self._log_subprocess_output,
-                                                           args=(self.process.stdout, "L2_FLOODER_STDOUT"), daemon=True)
+            # --- MODIFICATION START: Use the new dedicated parser for stdout ---
+            local_flooder_stdout_thread = threading.Thread(target=self._parse_l2_flooder_output,
+                                                           args=(self.process.stdout,), daemon=True)
+            # Use the old generic logger for stderr, which will only show output in verbose mode
             local_flooder_stderr_thread = threading.Thread(target=self._log_subprocess_output,
                                                            args=(self.process.stderr, "L2_FLOODER_STDERR"), daemon=True)
+            # --- MODIFICATION END ---
+
             local_flooder_stdout_thread.start();
             active_threads.append(local_flooder_stdout_thread)
             local_flooder_stderr_thread.start();
@@ -515,7 +582,7 @@ class L2TrafficTest:
                     log_source_label = "(Local Tx)"
 
                 latest_latency_val_for_metrics = self.data["latency"][-1] if self.data.get("latency") else \
-                self.latency_config["ping_timeout_placeholder_ms"]
+                    self.latency_config["ping_timeout_placeholder_ms"]
 
                 self._log(
                     f"Target: {self.target_l2_rate:.2f} Mbps, Actual Throughput: {actual_throughput_for_log:.2f} Mbps {log_source_label}, Latency: {latest_latency_val_for_metrics if latest_latency_val_for_metrics != self.latency_config['ping_timeout_placeholder_ms'] else 'N/A'} ms")
@@ -738,10 +805,10 @@ class L2TrafficTest:
         ]
         if self.remote_ip:
             details.append(("Remote Target (Ping/Agent)", self.remote_ip))
-        details.append(("Initial Skip Period", f"{self.initial_skip_seconds} seconds (for summary stats)"))
+        #details.append(("Initial Skip Period", f"{self.initial_skip_seconds} seconds (for summary stats)"))
 
         details.append(("", ""))
-        details.append(("--- Actual Throughput Statistics ---", None))
+        details.append(("----- Throughput Statistics -----"))
         details.append((f"  Min Throughput {throughput_source_for_stats}", min_tp_str))
         details.append((f"  Avg Throughput {throughput_source_for_stats}", avg_tp_str))
         details.append((f"  Max Throughput {throughput_source_for_stats}", max_tp_str))
@@ -820,4 +887,3 @@ class L2TrafficTest:
                             widget.config(state="normal")
                     except Exception as e_ui:
                         self._log(f"[UI Error] Configuring '{key}': {e_ui}", is_verbose=True)
-
