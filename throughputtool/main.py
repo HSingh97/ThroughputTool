@@ -3,12 +3,12 @@
 import ttkbootstrap as tb
 import psutil
 from tkinter import ttk  # Ensure ttk is imported if any direct ttk.Widget calls remain (though ui_layout handles most)
-from .ui_layout import create_layout
-from .graph_manager import GraphManager
-from .iperf_test import IperfTest
-from .flood_ping_test import FloodPingTest
-from .utils import export_log, save_graph
-from .l2_traffic_test import L2TrafficTest
+from ui_layout import create_layout
+from graph_manager import GraphManager
+from iperf_test import IperfTest
+from flood_ping_test import FloodPingTest
+from utils import export_log, save_graph
+from l2_traffic_test import L2TrafficTest
 import time
 import warnings
 

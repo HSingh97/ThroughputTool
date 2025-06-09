@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "throughputtool"
-version = "0.1.0"  # Or your desired version
+version = "1.0.0"
+
 description = "A GUI tool for testing network throughput and related metrics."
 readme = "README.md" # Create a README.md file if you haven't already
 requires-python = ">=3.7"
-license = { text = "MIT" } # Or your chosen license
+license = { text = "MIT" }
 authors = [
-  { name = "Your Name", email = "your.email@example.com" }, # Replace with your details
+  { name = "Harmanjot Singh", email = "harmanjot.singh@senao.com" }, # Replace with your details
 ]
 keywords = ["network", "throughput", "iperf3", "ping", "l2", "gui", "tester"]
 

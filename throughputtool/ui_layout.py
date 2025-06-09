@@ -6,7 +6,7 @@ from tkinter import scrolledtext
 
 
 def create_layout(app, interfaces):
-    app.title("Smart Throughput & Flood Ping Tester")
+    app.title("Throughput & Flood Ping Tester - 1.0.0")
     app.attributes("-zoomed", True)
 
     main_frame = ttk.Frame(app, padding=10)
