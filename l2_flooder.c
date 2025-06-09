@@ -90,7 +90,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // --- MODIFICATION: Check for 'quiet' argument ---
     if (argc > 1 && strcmp(argv[argc - 1], "quiet") == 0) {
         quiet_mode = 1;
     }

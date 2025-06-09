@@ -52,8 +52,8 @@ class L2TrafficTest:
         }
         self.ethertype_code = ethertype_map.get(self.ethertype_str, "0x0800")
 
-        # New variable to hold final stats from the C program
         self.l2_flooder_packets_sent = None
+        self.high_load_warning_logged = False
 
         self.remote_ip = remote_ip
         self.remote_user = remote_user
@@ -73,9 +73,9 @@ class L2TrafficTest:
         self.latency_stop_flag = False
         self.latency_config = {
             "ping_interval_s": 1,
-            "ping_packet_timeout_s": 4,  # Increased from 1 to 4 seconds
+            "ping_packet_timeout_s": 4,
             "ping_count": 1,
-            "ping_process_timeout_margin_s": 2,  # Subprocess timeout will be (4*1)+2 = 6s
+            "ping_process_timeout_margin_s": 2,
             "ping_timeout_placeholder_ms": 9999.0
         }
         self.ping_rtt_pattern = re.compile(r"time=([\d.]+)\s*ms", re.IGNORECASE)
@@ -102,9 +102,9 @@ class L2TrafficTest:
                 if self.verbose or not is_verbose: print(msg)
 
     def run(self):
-        self._log("[*] L2/L3 Traffic Test thread starting...")
         self.stop_flag = False
         self.latency_stop_flag = False
+        self.high_load_warning_logged = False
 
         for key in ["local_tx", "local_rx", "latency", "timestamp", "throughput"]:
             self.data.setdefault(key, []).clear()
@@ -149,7 +149,7 @@ class L2TrafficTest:
             try:
                 cmd = ["ping",
                        "-c", str(self.latency_config["ping_count"]),
-                       "-W", str(self.latency_config["ping_packet_timeout_s"]),  # -W uses seconds
+                       "-W", str(self.latency_config["ping_packet_timeout_s"]),
                        self.remote_ip]
 
                 process_timeout = (self.latency_config["ping_packet_timeout_s"] * self.latency_config["ping_count"]) + \
@@ -169,23 +169,12 @@ class L2TrafficTest:
                     matches = self.ping_rtt_pattern.findall(output)
                     if matches:
                         latency_value = float(matches[-1])
-                    elif "0% packet loss" not in output and \
-                            ("100% packet loss" in output or ping_proc.returncode != 0):
-                        if self.verbose: self._log("[LatencyMon] Ping timeout or 100% loss.", is_verbose=True)
-                    elif "0% packet loss" in output and not matches and not avg_match:
-                        if self.verbose: self._log(
-                            "[LatencyMon] Ping OK but no RTT parsed. Assuming near-zero or check ping output format.",
-                            is_verbose=True)
-                        latency_value = 0.01
-
-                if self.verbose: self._log(f"[LatencyMon] Parsed latency: {latency_value} ms", is_verbose=True)
 
             except subprocess.TimeoutExpired:
                 if self.verbose: self._log("[LatencyMon] Ping command timed out.", is_verbose=True)
             except FileNotFoundError:
                 self._log("[ERROR] Ping command not found. Latency monitoring stopping.", is_verbose=False)
                 self.latency_stop_flag = True
-                latency_value = self.latency_config["ping_timeout_placeholder_ms"]
             except Exception as e:
                 if self.verbose: self._log(f"[LatencyMon] Error: {e}", is_verbose=True)
 
@@ -398,35 +387,24 @@ class L2TrafficTest:
             self.ssh_client = None
             self._log("[+] SSH Disconnected.", is_verbose=True)
 
-    # --- MODIFICATION START: New method to parse l2_flooder output ---
     def _parse_l2_flooder_output(self, pipe):
-        """
-        Parses output from the l2_flooder C program.
-        In verbose mode, it prints everything.
-        In non-verbose mode, it hides all output except for a final summary message
-        which it constructs from a special output line from the C program.
-        """
         try:
             for line in iter(pipe.readline, ''):
                 line = line.strip()
                 if not line:
                     continue
 
-                # In verbose mode, log everything from the flooder's stdout for debugging.
                 if self.verbose:
                     self._log(f"[L2_FLOODER_STDOUT] {line}", is_verbose=True)
                     continue
 
-                # In non-verbose mode, only look for the final statistics line.
                 if line.startswith("FINAL_STATS:PacketsSent="):
                     try:
                         count_str = line.split('=')[1]
                         self.l2_flooder_packets_sent = int(count_str)
-                        # Log a clean, user-friendly message.
                         self._log(
                             f"[Info] Traffic generator stopped. Total packets sent: {self.l2_flooder_packets_sent:,}")
                     except (IndexError, ValueError):
-                        # Log an error if parsing fails, but only in verbose mode.
                         self._log(f"[Warning] Could not parse final packet count: {line}", is_verbose=True)
 
         except Exception as e:
@@ -434,10 +412,7 @@ class L2TrafficTest:
         finally:
             if pipe: pipe.close()
 
-    # --- MODIFICATION END ---
-
     def _log_subprocess_output(self, pipe, pipe_name_prefix):
-        """Generic handler for stderr or other verbose-only streams."""
         try:
             for line in iter(pipe.readline, ''):
                 if line: self._log(f"[{pipe_name_prefix}] {line.strip()}", is_verbose=self.verbose)
@@ -449,10 +424,25 @@ class L2TrafficTest:
             if pipe: pipe.close()
 
     def _run_test(self):
-        # --- MODIFICATION: Reset packet count at the start of each test ---
         self.l2_flooder_packets_sent = None
 
-        self._log("\n=== L2/L3 Traffic Test Started ===")
+        self._log("\n" + "-" * 50)
+        self._log("L2/L3 Traffic Test Starting with Configuration:")
+        config_details = [
+            ("Interface", self.iface),
+            ("Target L2 Rate", f"{self.target_l2_rate:.2f} Mbps"),
+            ("Packet Size", f"{self.packet_size} bytes"),
+            ("EtherType", f"{self.ethertype_str} ({self.ethertype_code})"),
+            ("Destination MAC", self.remote_mac if self.remote_mac else "Broadcast (ff:ff:ff:ff:ff:ff)"),
+        ]
+        if self.remote_ip:
+            config_details.append(("Remote Target (Ping/Agent)", self.remote_ip))
+
+        for key, value in config_details:
+            self._log(f"  {key:<25}: {value}")
+        self._log("-" * 50)
+
+        self._log("\n=== Test in Progress... ===")
         test_run_start_time = time.time()
 
         active_threads = []
@@ -508,12 +498,10 @@ class L2TrafficTest:
                     self._log(
                         "[Info] 'VLAN' selected. Generating VLAN-tagged frames with cycling IDs (1-4094) and inner protocol IPv4 (0x0800).")
 
-            # --- MODIFICATION START: Add 'quiet' argument if not in verbose mode ---
             cmd = ["sudo", flooder_path_str, self.iface, str(self.packet_size),
                    ethertype_for_flooder, dst_mac, str(self.target_l2_rate), vlan_id_arg]
             if not self.verbose:
                 cmd.append("quiet")
-            # --- MODIFICATION END ---
 
             self._log(f"[*] Full command to execute: {' '.join(cmd)}", is_verbose=True)
 
@@ -523,13 +511,10 @@ class L2TrafficTest:
                 f"[*] Local l2_flooder process started with PID: {self.process.pid} (PGID: {os.getpgid(self.process.pid) if hasattr(os, 'getpgid') else 'N/A'})",
                 is_verbose=True)
 
-            # --- MODIFICATION START: Use the new dedicated parser for stdout ---
             local_flooder_stdout_thread = threading.Thread(target=self._parse_l2_flooder_output,
                                                            args=(self.process.stdout,), daemon=True)
-            # Use the old generic logger for stderr, which will only show output in verbose mode
             local_flooder_stderr_thread = threading.Thread(target=self._log_subprocess_output,
                                                            args=(self.process.stderr, "L2_FLOODER_STDERR"), daemon=True)
-            # --- MODIFICATION END ---
 
             local_flooder_stdout_thread.start();
             active_threads.append(local_flooder_stdout_thread)
@@ -568,6 +553,19 @@ class L2TrafficTest:
                 self.data["local_rx"].append(local_rx_rate)
                 self.data["timestamp"].append(current_data_collection_ts)
 
+                if not self.high_load_warning_logged and self.target_l2_rate > 20:
+                    throughput_for_check = local_tx_rate
+                    # Use remote RX rate for check if it's available, as it's more accurate
+                    if self.measure_remote_rx and self.data["remote_rx"]:
+                        throughput_for_check = self.data["remote_rx"][-1]
+
+                    # # Check if we are more than 3 seconds into the test to avoid false positives at startup
+                    # if time.time() - test_run_start_time > 3 and throughput_for_check < (self.target_l2_rate * 0.8):
+                    #     self._log(
+                    #         "\n[Warning] System resource limit may be reached. Actual throughput is below target.")
+                    #     self._log("           This can cause high latency and a delay when stopping the test.\n")
+                    #     self.high_load_warning_logged = True
+
                 actual_throughput_for_log = 0.0
                 log_source_label = "(N/A)"
                 latest_remote_rx_val_for_metrics = 0.0
@@ -597,62 +595,36 @@ class L2TrafficTest:
                                                  remote_rx_val=latest_remote_rx_val_for_metrics)
 
                 if self.graph and current_data_collection_ts >= end_of_skip_period_ts:
-                    ts_all_for_graph = self.data.get("timestamp", [])
+                    ts_all = self.data.get("timestamp", [])
                     plot_start_index = 0
-                    for i, ts_val in enumerate(ts_all_for_graph):
+                    for i, ts_val in enumerate(ts_all):
                         if ts_val >= end_of_skip_period_ts:
                             plot_start_index = i
                             break
                     else:
-                        plot_start_index = len(ts_all_for_graph)
+                        plot_start_index = len(ts_all)
 
-                    if plot_start_index < len(ts_all_for_graph):
-                        ts_p = ts_all_for_graph[plot_start_index:]
-                        effective_plot_len = len(ts_p)
+                    if plot_start_index < len(ts_all):
+                        ts_p = ts_all[plot_start_index:]
+                        num_expected_points = len(ts_p)
 
-                        lrx_all_for_graph = self.data.get("local_rx", [])
-                        lrx_p = lrx_all_for_graph[max(0, len(lrx_all_for_graph) - effective_plot_len):]
+                        lrx_raw = self.data.get("local_rx", [])[plot_start_index:]
+                        lat_raw = self.data.get("latency", [])[plot_start_index:]
+                        rrx_raw = self.data.get("remote_rx", [])[plot_start_index:] if self.measure_remote_rx else []
 
-                        lat_all_source_for_graph = self.data.get("latency", [])
-                        if latency_monitor_started_successfully:
-                            lat_slice = lat_all_source_for_graph[
-                                        max(0, len(lat_all_source_for_graph) - effective_plot_len):]
-                            lat_p = [val if val != self.latency_config["ping_timeout_placeholder_ms"] else 0 for val in
-                                     lat_slice]
-                        else:
-                            lat_p = [0.0] * effective_plot_len
+                        lrx_p = lrx_raw + [0.0] * (num_expected_points - len(lrx_raw))
+                        lat_padded = lat_raw + [self.latency_config["ping_timeout_placeholder_ms"]] * (
+                                    num_expected_points - len(lat_raw))
+                        lat_p = [val if val != self.latency_config["ping_timeout_placeholder_ms"] else 0 for val in
+                                 lat_padded]
 
-                        rrx_all_source_for_graph = self.data.get("remote_rx", []) if self.measure_remote_rx else []
                         if self.measure_remote_rx:
-                            rrx_slice = rrx_all_source_for_graph[
-                                        max(0, len(rrx_all_source_for_graph) - effective_plot_len):]
-                            rrx_p = rrx_slice
+                            rrx_p = rrx_raw + [0.0] * (num_expected_points - len(rrx_raw))
                         else:
-                            rrx_p = [0.0] * effective_plot_len
+                            rrx_p = [0.0] * num_expected_points
 
-                        final_len = min(len(ts_p), len(lrx_p), len(lat_p), len(rrx_p))
-                        if final_len > 0 and final_len == len(ts_p):
-                            self.graph.update_graphs(
-                                ts_p[:final_len],
-                                lrx_p[-final_len:],
-                                rrx_p[-final_len:],
-                                lat_p[-final_len:]
-                            )
-                        elif self.verbose and final_len != len(ts_p):
-                            self._log(
-                                f"[Graph] Length mismatch for plotting: ts={len(ts_p)}, lrx={len(lrx_p)}, rrx={len(rrx_p)}, lat={len(lat_p)}. Plotting common len {final_len}.",
-                                is_verbose=True)
-                            if final_len > 0:
-                                self.graph.update_graphs(
-                                    ts_p[:final_len],
-                                    lrx_p[-final_len:],
-                                    rrx_p[-final_len:],
-                                    lat_p[-final_len:]
-                                )
-                elif self.graph and self.verbose:
-                    self._log(
-                        f"Graphing deferred: Still in initial skip period. Current: {current_data_collection_ts:.1f}, Skip End: {end_of_skip_period_ts:.1f}",
-                        is_verbose=True)
+                        if num_expected_points > 0:
+                            self.graph.update_graphs(ts_p, lrx_p, rrx_p, lat_p)
 
         except Exception as e:
             self._log(f"[ERROR] Test execution failed: {e}")
@@ -742,19 +714,12 @@ class L2TrafficTest:
         duration = int(time.time() - test_run_start_time)
         mins, secs = divmod(duration, 60)
 
-        # Get all collected data
-        all_timestamps = self.data.get("timestamp", [])
         all_local_tx = self.data.get("local_tx", [])
         all_remote_rx = self.data.get("remote_rx", [])
         all_latency = self.data.get("latency", [])
 
-        # Determine the actual number of points to skip based on initial_skip_seconds
-        # This assumes that each data point in the lists corresponds to roughly one second of measurement.
-        # For more precise timestamp-based skipping, a different approach would be needed if data collection
-        # intervals are highly variable or not synchronized.
         skip_n_points = self.initial_skip_seconds
 
-        # Slice data lists for summary, ensuring we don't try to slice beyond list length
         local_tx_for_summary = all_local_tx[skip_n_points:] if len(all_local_tx) > skip_n_points else []
         remote_rx_for_summary = []
         if self.measure_remote_rx:
@@ -779,7 +744,6 @@ class L2TrafficTest:
 
         min_tp_str, avg_tp_str, max_tp_str = "N/A", "N/A", "N/A"
 
-        # Filter out non-positive values for Min/Avg/Max throughput calculation from the valid window
         meaningful_tp_stats = [x for x in primary_throughput_series_for_stats if
                                isinstance(x, (int, float)) and x > 0.01]
 
@@ -787,8 +751,7 @@ class L2TrafficTest:
             min_tp_str = f"{min(meaningful_tp_stats):.2f} Mbps"
             avg_tp_str = f"{statistics.mean(meaningful_tp_stats):.2f} Mbps"
             max_tp_str = f"{max(meaningful_tp_stats):.2f} Mbps"
-        elif primary_throughput_series_for_stats:  # If list had only 0s or non-numerics after skip
-            # Check if there were any numerics at all in the valid window, even if they were 0 or <=0.01
+        elif primary_throughput_series_for_stats:
             all_numeric_in_valid_series = [x for x in primary_throughput_series_for_stats if
                                            isinstance(x, (int, float))]
             if all_numeric_in_valid_series:
@@ -805,10 +768,9 @@ class L2TrafficTest:
         ]
         if self.remote_ip:
             details.append(("Remote Target (Ping/Agent)", self.remote_ip))
-        #details.append(("Initial Skip Period", f"{self.initial_skip_seconds} seconds (for summary stats)"))
 
         details.append(("", ""))
-        details.append(("----- Throughput Statistics -----"))
+        details.append(("--- Actual Throughput Statistics ---", None))
         details.append((f"  Min Throughput {throughput_source_for_stats}", min_tp_str))
         details.append((f"  Avg Throughput {throughput_source_for_stats}", avg_tp_str))
         details.append((f"  Max Throughput {throughput_source_for_stats}", max_tp_str))

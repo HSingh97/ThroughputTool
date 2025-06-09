@@ -85,7 +85,7 @@ def create_layout(app, interfaces):
     traffic_var = tk.StringVar(value="L2/L3 Traffic")
     protocol_var = tk.StringVar(value="UDP")
     direction_var = tk.StringVar(value="Uplink")
-    packet_size_var = tk.StringVar(value="1400")
+    packet_size_var = tk.StringVar(value="1400") # Default packet size
     ethertype_var = tk.StringVar(value="MPLS")
 
     def create_combo(parent, label_text, var, values, row_idx):
@@ -102,8 +102,8 @@ def create_layout(app, interfaces):
 
     ui_widgets["Speed Profile_label"] = ttk.Label(right_form, text="Speed Profile")
     ui_widgets["Speed Profile_combo"] = ttk.Combobox(right_form, textvariable=profile_var,
-                                                     values=["Safe", "Moderate", "Aggressive"], state="readonly",
-                                                     width=18)
+                                                      values=["Safe", "Moderate", "Aggressive"], state="readonly",
+                                                      width=18)
 
     ui_widgets["Packet Size_label"] = ttk.Label(right_form, text="Packet Size")
     ui_widgets["Packet Size_entry"] = ttk.Entry(right_form, textvariable=packet_size_var, width=21)
@@ -129,9 +129,6 @@ def create_layout(app, interfaces):
         "total": ttk.Label(metrics_frame, text="Total Bw: N/A")
     }
 
-    # New Layout for metrics:
-    # Row 0: Duration | Latency | Loss
-    # Row 1: Local Tx | Local Rx | Remote Rx (conditional) | Total Bw
     metrics_frame.columnconfigure(0, weight=1);
     metrics_frame.columnconfigure(1, weight=1)
     metrics_frame.columnconfigure(2, weight=1);
@@ -139,13 +136,11 @@ def create_layout(app, interfaces):
 
     metrics_labels["duration"].grid(row=0, column=0, padx=5, pady=2, sticky="w")
     metrics_labels["latency"].grid(row=0, column=1, padx=5, pady=2, sticky="w")
-    metrics_labels["loss"].grid(row=0, column=2, padx=5, pady=2, sticky="w")  # Loss on first row
+    metrics_labels["loss"].grid(row=0, column=2, padx=5, pady=2, sticky="w")
 
     metrics_labels["local_tx"].grid(row=1, column=0, padx=5, pady=2, sticky="w")
     metrics_labels["local_rx"].grid(row=1, column=1, padx=5, pady=2, sticky="w")
-    # metrics_labels["remote_rx"] is gridded by update_visibility
-    metrics_labels["total"].grid(row=1, column=3, padx=5, pady=2,
-                                 sticky="w")  # Total Bw as 4th item in this row if remote_rx is col 2
+    metrics_labels["total"].grid(row=1, column=3, padx=5, pady=2, sticky="w")
 
     def update_visibility(*args):
         traffic = traffic_var.get()
@@ -164,7 +159,7 @@ def create_layout(app, interfaces):
             if visible and new_row is not None:
                 if lbl:
                     lbl.grid(row=new_row, column=col, sticky=sticky_lbl,
-                             pady=2, padx=(5 if parent == ssh_details_frame else 0))  # Check parent for padx
+                             pady=2, padx=(5 if parent == ssh_details_frame else 0))
                 if wdgt:
                     wdgt.grid(row=new_row, column=(entry_col if lbl else col),
                               pady=2, sticky=sticky_wdgt,
@@ -173,11 +168,12 @@ def create_layout(app, interfaces):
                 if lbl: lbl.grid_remove()
                 if wdgt: wdgt.grid_remove()
 
-        # Default visibility
+        # Default visibility - HIDE ALL DYNAMIC WIDGETS
         set_visibility("Speed Profile", visible=False)
         set_visibility("Protocol (iperf3)", visible=False)
         set_visibility("Direction (iperf3)", visible=False)
         set_visibility("EtherType (L2/L3)", visible=False)
+        set_visibility("Packet Size", visible=False) # Hide packet size by default
         set_visibility("Latency Threshold (ms)", parent=left_form, visible=False)
         set_visibility("Remote MAC", parent=left_form, visible=False)
         set_visibility("Target L2 Rate (Mbps)", parent=left_form, visible=False)
@@ -187,89 +183,74 @@ def create_layout(app, interfaces):
         if metrics_labels.get("remote_rx"):
             if traffic == "L2/L3 Traffic":
                 metrics_labels["remote_rx"].grid(row=1, column=2, padx=5, pady=2,
-                                                 sticky="w")  # Its place in the metrics layout
+                                                 sticky="w")
             else:
                 metrics_labels["remote_rx"].grid_remove()
 
-        set_visibility("Packet Size", new_row=3, visible=True)
+        # Sequentially place visible widgets on the right form
         row_idx_right = 2
 
         if traffic == "iperf3":
-            set_visibility("Packet Size", p_text="Block/Length Size (iperf3)")
-            set_visibility("Protocol (iperf3)", new_row=row_idx_right, visible=True);
-            row_idx_right += 1
-            set_visibility("Direction (iperf3)", new_row=row_idx_right, visible=True);
-            row_idx_right += 1
+            set_visibility("Protocol (iperf3)", new_row=row_idx_right, visible=True); row_idx_right += 1
+            set_visibility("Direction (iperf3)", new_row=row_idx_right, visible=True); row_idx_right += 1
             if protocol_sel == "UDP":
-                set_visibility("Speed Profile", new_row=row_idx_right, visible=True);
-                row_idx_right += 1
-                if ui_widgets["Direction (iperf3)_combo"].cget('values') != ("Uplink", "Downlink", "Bi-Di"):
-                    ui_widgets["Direction (iperf3)_combo"]['values'] = ("Uplink", "Downlink", "Bi-Di")
-                    #if direction_var.get() == "Bi-Di": direction_var.set("Uplink")
-            else:  # TCP
-                if ui_widgets["Direction (iperf3)_combo"].cget('values') != ("Uplink", "Downlink", "Bi-Di"):
-                    ui_widgets["Direction (iperf3)_combo"]['values'] = ("Uplink", "Downlink", "Bi-Di")
+                set_visibility("Speed Profile", new_row=row_idx_right, visible=True); row_idx_right += 1
+            set_visibility("Packet Size", new_row=row_idx_right, p_text="Block/Length Size (iperf3)", visible=True); row_idx_right += 1
+
+            if ui_widgets["Direction (iperf3)_combo"].cget('values') != ("Uplink", "Downlink", "Bi-Di"):
+                ui_widgets["Direction (iperf3)_combo"]['values'] = ("Uplink", "Downlink", "Bi-Di")
 
         elif traffic == "Flood Ping":
-            set_visibility("Packet Size", p_text="Packet Size (Flood Ping)")
-            set_visibility("Speed Profile", new_row=row_idx_right, visible=True);
-            row_idx_right += 1
+            set_visibility("Speed Profile", new_row=row_idx_right, visible=True); row_idx_right += 1
+            set_visibility("Packet Size", new_row=row_idx_right, p_text="Packet Size (Flood Ping)", visible=True); row_idx_right += 1
             set_visibility("Latency Threshold (ms)", new_row=2, parent=left_form, visible=True)
 
         elif traffic == "L2/L3 Traffic":
-            set_visibility("Packet Size", p_text="Packet Size (L2/L3)")  # Already row 3
-            set_visibility("Speed Profile", new_row=row_idx_right, visible=True);
-            row_idx_right += 1  # After packet size on right
-            # EtherType is row_idx_right on right form after speed profile
-            set_visibility("EtherType (L2/L3)", new_row=row_idx_right, visible=True);
-            row_idx_right += 1
+            set_visibility("Speed Profile", new_row=row_idx_right, visible=True); row_idx_right += 1
+            set_visibility("EtherType (L2/L3)", new_row=row_idx_right, visible=True); row_idx_right += 1
+            # Place Packet Size below EtherType, as requested
+            set_visibility("Packet Size", new_row=row_idx_right, p_text="Packet Size (L2/L3)", visible=True); row_idx_right += 1
 
+            # Left form widgets
             set_visibility("Remote MAC", new_row=3, parent=left_form, visible=True)
             set_visibility("Target L2 Rate (Mbps)", new_row=4, parent=left_form, visible=True)
-            # SSH details frame gridding on left form
-            ssh_frame_row = current_row_left  # Place it after dynamically created fields_left
+            ssh_frame_row = current_row_left
             set_visibility("ssh_details", new_row=ssh_frame_row, parent=left_form, visible=True, col=0,
                            columnspan_wdgt=2)
 
+        # Loss Threshold logic
         loss_entry = entries.get("Loss Threshold (%)")
-        loss_label_widget = ui_widgets.get("Loss Threshold (%)_label")  # Get the label too
+        loss_label_widget = ui_widgets.get("Loss Threshold (%)_label")
 
-        if loss_entry and loss_label_widget:  # Check both exist
+        if loss_entry and loss_label_widget:
             loss_visible_for_current_type = traffic in ["iperf3", "Flood Ping"]
             set_visibility("Loss Threshold (%)", new_row=1, parent=left_form, visible=loss_visible_for_current_type)
             if loss_visible_for_current_type:
                 if traffic == "iperf3":
                     if protocol_sel == "UDP" and loss_entry.get() != "1.0":
-                        loss_entry.delete(0, tk.END);
-                        loss_entry.insert(0, "1.0")
+                        loss_entry.delete(0, tk.END); loss_entry.insert(0, "1.0")
                     elif protocol_sel == "TCP" and loss_entry.get() != "10.0":
-                        loss_entry.delete(0, tk.END);
-                        loss_entry.insert(0, "10.0")
+                        loss_entry.delete(0, tk.END); loss_entry.insert(0, "10.0")
                 elif traffic == "Flood Ping":
                     if loss_entry.get() != "10.0":
-                        loss_entry.delete(0, tk.END);
-                        loss_entry.insert(0, "10.0")
+                        loss_entry.delete(0, tk.END); loss_entry.insert(0, "10.0")
 
     traffic_var.trace_add("write", update_visibility)
     protocol_var.trace_add("write", update_visibility)
     update_visibility()
 
-    # --- Buttons, Output Area, Graphs, Status Bar (Mostly as before) ---
-    # (Button Frame)
+    # --- Buttons, Output Area, Graphs, Status Bar ---
     button_frame = ttk.Frame(settings_frame)
-    button_frame.grid(row=1, column=0, columnspan=2, pady=10, sticky="ew")  # Moved to row=1 under forms
+    button_frame.grid(row=1, column=0, columnspan=2, pady=10, sticky="ew")
     start_button = ttk.Button(button_frame, text="Start Test")
     stop_button = ttk.Button(button_frame, text="Stop Test", state="disabled")
-    start_button.pack(side="left", padx=5, expand=True, fill="x")  # Use pack for button_frame
+    start_button.pack(side="left", padx=5, expand=True, fill="x")
     stop_button.pack(side="left", padx=5, expand=True, fill="x")
 
-    # (Output Area) - row=4 in settings_frame
     monospace_font = ("Courier New", 10)
     output_area = scrolledtext.ScrolledText(settings_frame, wrap="none", font=monospace_font, height=10)
     output_area.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=0, pady=5)
-    # settings_frame.rowconfigure(4, weight=1) # Already done at the top
 
-    # (Output Frame Content - Graphs and Export)
     graph_container = ttk.Frame(output_frame)
     graph_container.pack(fill="both", expand=True, padx=5, pady=5)
     tp_frame = ttk.LabelFrame(graph_container, text="Throughput Graph")
@@ -289,9 +270,8 @@ def create_layout(app, interfaces):
     status_bar = ttk.Label(app, text="Ready", relief="sunken", anchor="w")
     status_bar.pack(side="bottom", fill="x", pady=(2, 0), ipady=2)
 
-    # Consolidate all UI elements main.py might need
     final_ui_elements = {
-        "entries": entries,  # Contains all Entry widgets created with labels in fields_left + SSH fields
+        "entries": entries,
         "iface_var": iface_var, "profile_var": profile_var, "traffic_var": traffic_var,
         "protocol_var": protocol_var, "direction_var": direction_var,
         "packet_size_var": packet_size_var, "ethertype_var": ethertype_var,
@@ -301,16 +281,13 @@ def create_layout(app, interfaces):
         "export_log_btn": export_log_btn, "save_tp_graph_btn": save_tp_graph_btn,
         "save_latency_graph_btn": save_latency_graph_btn,
         "status_bar": status_bar, "metrics_labels": metrics_labels,
-        # Add specific widgets if main.py needs direct access beyond what's in entries/vars
         "packet_size_entry": ui_widgets["Packet Size_entry"],
         "packet_size_label": ui_widgets["Packet Size_label"],
-        # Include other specific widgets from ui_widgets if needed by main.py
-        # Latency Threshold Label and Remote MAC Label (original specific returns)
         "latency_label": ui_widgets.get("Latency Threshold (ms)_label"),
         "remote_mac_label": ui_widgets.get("Remote MAC_label"),
         "ethertype_label": ui_widgets["EtherType (L2/L3)_label"],
         "ethertype_menu": ui_widgets["EtherType (L2/L3)_combo"],
-        "protocol_label": ui_widgets["Protocol (iperf3)_label"],  # For main.py to potentially access
+        "protocol_label": ui_widgets["Protocol (iperf3)_label"],
         "protocol_menu": ui_widgets["Protocol (iperf3)_combo"],
         "direction_label": ui_widgets["Direction (iperf3)_label"],
         "direction_menu": ui_widgets["Direction (iperf3)_combo"],
