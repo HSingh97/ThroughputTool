@@ -448,30 +448,35 @@ class IperfTest:
                     rx_mbps = downlink_bps_to_use / 1_000_000.0
                     log_source_tx = "(N/A)"
                 elif self.direction == "Bi-Di":
-                    server_output_json = result_json.get("server_output_json", {})
-                    server_sum_received_bidir = server_output_json.get("end", {}).get("sum_received", {})
-                    if server_sum_received_bidir and "bits_per_second" in server_sum_received_bidir:
-                        tx_mbps = server_sum_received_bidir.get("bits_per_second", 0) / 1_000_000.0
-                        log_source_tx = "(BiDi SrvRcv via SrvOutput)";
-                        used_server_perspective_for_tx = True
-                    elif sum_sent_data_last and "bits_per_second" in sum_sent_data_last:
-                        tx_mbps = sum_sent_data_last.get("bits_per_second", 0) / 1_000_000.0
-                        log_source_tx = "(BiDi CliSent Sum)"
-                    else:
-                        tx_mbps = 0.0
+                    calculated_uplink_bps = 0
+                    calculated_downlink_bps = 0
+                    end_streams_data = end_data.get("streams", [])
+                    num_tx_streams_processed, num_rx_streams_processed = 0, 0
 
-                    if sum_received_data_last and "bits_per_second" in sum_received_data_last:
-                        rx_mbps = sum_received_data_last.get("bits_per_second", 0) / 1_000_000.0
-                        log_source_rx = "(BiDi CliRcv Sum)"
-                    elif server_output_json:
-                        server_sum_sent_bidir = server_output_json.get("end", {}).get("sum_sent", {})
-                        if server_sum_sent_bidir and "bits_per_second" in server_sum_sent_bidir:
-                            rx_mbps = server_sum_sent_bidir.get("bits_per_second", 0) / 1_000_000.0
-                            log_source_rx = "(BiDi SrvSent via SrvOutput)"
-                        else:
-                            rx_mbps = 0.0
+                    # This fallback logic can be useful if the streams array is missing
+                    if not end_streams_data:
+                        if sum_received_data_last and "bits_per_second" in sum_received_data_last:
+                            calculated_uplink_bps = sum_received_data_last.get("bits_per_second", 0)
+                        if sum_sent_data_last and "bits_per_second" in sum_sent_data_last:
+                            calculated_downlink_bps = sum_sent_data_last.get("bits_per_second", 0)
                     else:
-                        rx_mbps = 0.0
+                        # This is the essential logic that was missing
+                        for stream_report in end_streams_data:
+                            stream_sender_info = stream_report.get("sender", {})
+                            stream_receiver_info = stream_report.get("receiver", {})
+                            is_client_tx_stream = stream_sender_info.get("sender", False)
+                            if is_client_tx_stream:
+                                calculated_uplink_bps += stream_receiver_info.get("bits_per_second", 0)
+                                num_tx_streams_processed += 1
+                            else:
+                                calculated_downlink_bps += stream_receiver_info.get("bits_per_second", 0)
+                                num_rx_streams_processed += 1
+                        log_source_tx = f"(Summed {num_tx_streams_processed} SrvRcv from streams)"
+                        log_source_rx = f"(Summed {num_rx_streams_processed} CliRcv from streams)"
+                        used_server_perspective_for_tx = True
+
+                    tx_mbps = calculated_uplink_bps / 1_000_000.0
+                    rx_mbps = calculated_downlink_bps / 1_000_000.0
 
                 total_achieved_mbps = tx_mbps + rx_mbps
                 loss_percent = 0.0
