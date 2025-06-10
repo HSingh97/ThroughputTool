@@ -2,7 +2,7 @@
 
 import ttkbootstrap as tb
 import psutil
-from tkinter import ttk  # Ensure ttk is imported if any direct ttk.Widget calls remain (though ui_layout handles most)
+from tkinter import ttk
 from ui_layout import create_layout
 from graph_manager import GraphManager
 from iperf_test import IperfTest
@@ -16,8 +16,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)  # For paramiko w
 
 
 def main():
-    app = tb.Window(themename="flatly")
-    # app.title and app.attributes set in create_layout
+    app = tb.Window(themename="yeti")
 
     try:
         interfaces = list(psutil.net_io_counters(pernic=True).keys())
@@ -25,7 +24,7 @@ def main():
         print(f"Error fetching interfaces: {e}. Defaulting to empty list.")
         interfaces = []
 
-    ui = create_layout(app, interfaces)  # ui dictionary holds all relevant widgets/vars
+    ui = create_layout(app, interfaces)
     graph = GraphManager(ui['graph_frames'])
 
     data_store = {
@@ -36,30 +35,40 @@ def main():
     test_runner = {'instance': None}
 
     def update_metrics(tx, rx, latency, loss, duration_secs, total, remote_rx_val=0.0):
-        # This function updates the text part of the labels.
-        # The labels themselves (e.g., "Local Tx: N/A") are created in ui_layout.py
         if ui.get('metrics_labels'):
             metrics = ui['metrics_labels']
 
-            # Update values, assuming label prefixes are set in ui_layout.py
-            if metrics.get('duration'): metrics['duration'].config(
-                text=f"Duration: {duration_secs // 60:02}:{duration_secs % 60:02}")
-            if metrics.get('latency'): metrics['latency'].config(text=f"Latency: {latency:.2f} ms")
-            if metrics.get('loss'): metrics['loss'].config(text=f"Loss: {loss:.2f}%")
+            if metrics.get('duration'):
+                metrics['duration'].config(text=f"Duration: {duration_secs // 60:02}:{duration_secs % 60:02}")
+            if metrics.get('local_tx'):
+                metrics['local_tx'].config(text=f"Local Tx: {tx:.2f} Mbps")
+            if metrics.get('local_rx'):
+                metrics['local_rx'].config(text=f"Local Rx: {rx:.2f} Mbps")
+            if metrics.get('remote_rx'):
+                metrics['remote_rx'].config(text=f"Remote Rx: {remote_rx_val:.2f} Mbps")
+            if metrics.get('total'):
+                metrics['total'].config(text=f"Total Bw: {total:.2f} Mbps")
 
-            if metrics.get('local_tx'): metrics['local_tx'].config(text=f"Local Tx: {tx:.2f} Mbps")
-            if metrics.get('local_rx'): metrics['local_rx'].config(text=f"Local Rx: {rx:.2f} Mbps")
+            # Update Latency with color coding
+            if metrics.get('latency'):
+                metrics['latency'].config(text=f"Latency: {latency:.2f} ms")
+                if latency > 150.0:
+                    metrics['latency'].config(bootstyle="danger")
+                elif latency > 75.0:
+                    metrics['latency'].config(bootstyle="warning")
+                else:
+                    metrics['latency'].config(bootstyle="default")
 
-            # Remote Rx label's text is updated here. Its visibility is handled by ui_layout.update_visibility
-            if metrics.get('remote_rx'): metrics['remote_rx'].config(text=f"Remote Rx: {remote_rx_val:.2f} Mbps")
+            # Update Loss with color coding
+            if metrics.get('loss'):
+                metrics['loss'].config(text=f"Loss: {loss:.2f}%")
+                if loss > 5.0:
+                    metrics['loss'].config(bootstyle="danger")
+                elif loss > 0.1:
+                    metrics['loss'].config(bootstyle="warning")
+                else:
+                    metrics['loss'].config(bootstyle="success")
 
-            if metrics.get('total'): metrics['total'].config(text=f"Total Bw: {total:.2f} Mbps")
-
-        # Ensure UI updates from threads are handled safely if necessary
-        # For Tkinter, if this callback is assigned to a test instance running in a thread,
-        # and then this function (which is in the main thread scope) is called by the test instance,
-        # it should be fine. If update_metrics itself was directly run in another thread,
-        # then app.after() would be needed for Tkinter calls.
 
     def start_test():
         if ui['output_area']:
@@ -70,17 +79,14 @@ def main():
         for btn_key in ['export_log_btn', 'save_tp_graph_btn', 'save_latency_graph_btn']:
             if ui.get(btn_key): ui[btn_key].config(state="disabled")
 
-        # Fetch values (ensure keys match what's in ui['entries'] from ui_layout.py)
         remote_ip = ui['entries']['Remote IP'].get()
         loss_thresh_str = ui['entries']['Loss Threshold (%)'].get()
         latency_thresh_str = ui['entries']['Latency Threshold (ms)'].get()
         remote_mac = ui['entries']["Remote MAC"].get()
         target_l2_rate_str = ui['entries']["Target L2 Rate (Mbps)"].get()
-
         remote_user = ui['entries']["Remote Username"].get()
         remote_pass = ui['entries']["Remote Password"].get()
         remote_iface = ui['entries']["Remote Interface"].get()
-
         iface = ui['iface_var'].get()
         profile = ui['profile_var'].get()
         traffic = ui['traffic_var'].get()
@@ -102,24 +108,20 @@ def main():
                 ui['output_area'].config(state='disabled')
             else:
                 print(log_msg_to_ui)
-            if ui.get('status_bar'): ui['status_bar'].config(text="Error: Invalid Input")
+            if ui.get('status_bar'): ui['status_bar'].config(text="Error: Invalid Input", bootstyle="danger")
             return
 
         for key_data in data_store: data_store[key_data].clear()
-        graph.update_graphs([], [], [], [])  # Reset graph
+        graph.update_graphs([], [], [], [])
 
         if ui.get('start_button'): ui['start_button'].config(state='disabled')
         if ui.get('stop_button'): ui['stop_button'].config(state='normal')
-        if ui.get('status_bar'): ui['status_bar'].config(text=f"Test Running: {traffic}...")
-
-        # ui_refs_for_test can just be the 'ui' dict itself, as test classes access specific keys.
-        # The L2TrafficTest _log method now directly uses self.ui.
+        if ui.get('status_bar'): ui['status_bar'].config(text=f"Test Running: {traffic}...", bootstyle="success")
 
         if traffic == "Flood Ping":
             tester = FloodPingTest(remote_ip, iface, packet_size, profile,
                                    latency_thresh, loss_thresh,
-                                   ui,  # Pass the main ui dict
-                                   data_store, graph,
+                                   ui, data_store, graph,
                                    update_metrics=update_metrics)
         elif traffic == "L2/L3 Traffic":
             measure_remote = bool(remote_ip and remote_user and remote_iface)
@@ -131,7 +133,7 @@ def main():
                 remote_iface_name=remote_iface, measure_remote_rx=measure_remote,
                 verbose=False
             )
-        else:  # iperf3
+        else:
             tester = IperfTest(
                 remote_ip=remote_ip, iface=iface, protocol=protocol,
                 packet_size=str(packet_size), direction=direction, profile=profile,

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "throughputtool"
-version = "1.0.0"
+version = "1.1.0"
 
 description = "A GUI tool for testing network throughput and related metrics."
 readme = "README.md" # Create a README.md file if you haven't already
