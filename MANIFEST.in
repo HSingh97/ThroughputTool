@@ -1,0 +1,14 @@
+include README.md
+# include LICENSE.txt # If you have a license file
+include l2_flooder.c  # Include the C source for reference
+
+# Include the 'throughputtool' package directory and its contents
+graft throughputtool
+
+# Ensure the compiled l2_flooder within the throughputtool directory is included
+# This might be redundant if [options.package_data] and graft throughputtool cover it,
+# but explicit can be good. However, setuptools usually handles package_data correctly.
+# For sdist, MANIFEST.in rules which files go into the tar.gz.
+# For wheel, setuptools decides based on package_data etc.
+# To be absolutely sure l2_flooder (the binary) is in the sdist:
+include throughputtool/l2_flooder
